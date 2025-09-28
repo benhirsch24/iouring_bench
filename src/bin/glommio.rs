@@ -23,7 +23,7 @@ fn main() -> Result<()> {
         Rc::get_mut(&mut cache).unwrap().insert("1".to_string(), SILLY_TEXT.to_string());
 
         // Server implementation
-        let listener = TcpListener::bind("127.0.0.1:80").unwrap();
+        let listener = TcpListener::bind("0.0.0.0:8080").unwrap();
         info!("Listening on {}", listener.local_addr().unwrap());
         loop {
             let mut stream = listener.accept().await.unwrap();
