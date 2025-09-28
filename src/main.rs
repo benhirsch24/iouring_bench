@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use io_uring::{IoUring, opcode, squeue::Entry, types};
 
 use std::collections::HashMap;
@@ -18,9 +19,10 @@ struct Request {
     fd: types::Fd,
     buffer: Vec<u8>,
     filled: usize,
-    response: Option<String>,
+    response: Option<Bytes>,
     responded: bool,
     cache: Rc<HashMap<String, String>>,
+    sent: usize,
 }
 
 impl Request {
@@ -32,6 +34,7 @@ impl Request {
             response: None,
             responded: false,
             cache,
+            sent: 0,
         }
     }
 
@@ -41,16 +44,31 @@ impl Request {
         return read_e.build().user_data(self.fd.0 as u64).into();
     }
 
-    fn advance(&mut self, n: usize) {
+    fn advance_read(&mut self, n: usize) {
         self.filled += n;
     }
 
-    unsafe fn respond(&mut self, resp: &str) -> Entry {
+    fn advance_write(&mut self, n: usize) {
+        self.sent += n;
+    }
+
+    fn done(&self) -> bool {
+        self.sent == self.response.as_ref().unwrap().len()
+    }
+
+    fn set_response(&mut self, resp: &str) {
         // Store response in this request as it needs to be allocated until the kernel has sent it
         // Eventually this could be a pointer to kernel owned buffer
-        self.response = Some(resp.to_string());
-        let ptr = self.response.as_mut().unwrap().as_mut_ptr();
-        let send_e = opcode::Send::new(self.fd, ptr, self.response.as_ref().unwrap().len() as u32);
+        self.response = Some(Bytes::copy_from_slice(resp.as_bytes()));
+    }
+
+    unsafe fn send(&mut self) -> Entry {
+        let len = self.response.as_ref().unwrap().len();
+        let byte_clone = (self.response.as_mut().unwrap()).clone();
+        let slice = byte_clone.slice(self.sent..len);
+        let ptr = slice.as_ptr();
+        let to_send : u32 = (len - self.sent) as u32;
+        let send_e = opcode::Send::new(self.fd, ptr, to_send);
         return send_e.build().user_data(self.fd.0 as u64).into();
     }
 
@@ -74,30 +92,36 @@ impl Request {
                     p if p.starts_with("/object") => {
                         let parts = p.split("/").collect::<Vec<_>>();
                         if parts.len() != 3 {
-                            let send = unsafe { self.respond(&format!("HTTP/1.1 400 Bad Request\r\nContent-Length: 25\r\n\r\nExpected /object/<object>")) };
+                            self.set_response(&format!("HTTP/1.1 400 Bad Request\r\nContent-Length: 25\r\n\r\nExpected /object/<object>"));
+                            let send = unsafe { self.send() };
                             sqe.push(send);
                         } else {
                             if let Some(o) = self.cache.get(&parts[2].to_string()) {
-                                let send = unsafe { self.respond(&format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}", o.len(), o)) };
+                                self.set_response(&format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}", o.len(), o));
+                                let send = unsafe { self.send() };
                                 sqe.push(send);
                             } else {
-                                let send = unsafe { self.respond(NOT_FOUND) };
+                                self.set_response(NOT_FOUND);
+                                let send = unsafe { self.send() };
                                 sqe.push(send);
                             }
                         }
                     },
                     "/health" => {
-                        let send = unsafe { self.respond(HEALTH_OK) };
+                        self.set_response(HEALTH_OK);
+                        let send = unsafe { self.send() };
                         sqe.push(send);
                     },
                     _ => {
-                        let send = unsafe { self.respond(NOT_FOUND) };
+                        self.set_response(NOT_FOUND);
+                        let send = unsafe { self.send() };
                         sqe.push(send);
                     }
                 }
             },
             None => {
-                let send = unsafe { self.respond(NOT_FOUND) };
+                self.set_response(NOT_FOUND);
+                let send = unsafe { self.send() };
                 sqe.push(send);
             }
         }
@@ -115,7 +139,7 @@ fn main() -> Result<(), std::io::Error> {
     let mut cache = Rc::new(HashMap::<String, String>::new());
     Rc::get_mut(&mut cache).unwrap().insert("1".to_string(), SILLY_TEXT.to_string());
 
-    let listener = std::net::TcpListener::bind("127.0.0.1:80").expect("tcp listener");
+    let listener = std::net::TcpListener::bind("0.0.0.0:8080").expect("tcp listener");
     let listener_fd = listener.as_raw_fd();
     let lfd = types::Fd(listener_fd);
     let mut sockaddr: libc::sockaddr = unsafe { std::mem::zeroed() };
@@ -140,6 +164,10 @@ fn main() -> Result<(), std::io::Error> {
             for e in uring.completion() {
                 match e.user_data() {
                     ACCEPT_CODE => {
+                        if e.result() == 127 {
+                            error!("Failed to accept");
+                            continue;
+                        }
                         info!("Accept! flags: {} result: {} ud: {}", e.flags(), e.result(), e.user_data());
 
                         // Create a new request object around this file descriptor and enqueue the
@@ -160,7 +188,6 @@ fn main() -> Result<(), std::io::Error> {
                             },
                         };
 
-                        debug!("Recv! flags: {} result: {} ud: {}", e.flags(), e.result(), e.user_data());
                         if e.result() == -1 {
                             error!("Request error: {}", req.fd.0);
                             unsafe { libc::close(req.fd.0); };
@@ -168,7 +195,6 @@ fn main() -> Result<(), std::io::Error> {
                             continue;
                         }
                         if e.result() == 0 {
-                            debug!("Read returned no bytes: {}", std::str::from_utf8(&req.buffer).unwrap());
                             unsafe { libc::close(req.fd.0); };
                             reqs.remove(&fd);
                             continue;
@@ -176,18 +202,40 @@ fn main() -> Result<(), std::io::Error> {
 
                         // The completion queue returned a successful write response
                         if req.responded {
+                            debug!("Write event! flags: {} result: {} ud: {}", e.flags(), e.result(), e.user_data());
+                            if e.result() < 0 {
+                                let error = match -e.result() {
+                                    libc::EFAULT => "efault",
+                                    libc::EPIPE => "epipe",
+                                    libc::EIO => "eio",
+                                    libc::EINVAL => "einval",
+                                    libc::EBADF => "ebadf",
+                                    _ => "other",
+                                };
+                                error!("Error on write: {} {}", e.result(), error);
+                                unsafe { libc::close(req.fd.0); };
+                                reqs.remove(&fd);
+                                continue;
+                            }
+                            req.advance_write(e.result().try_into().unwrap());
                             // TODO: This means no keep-alive
                             // TODO: Probably also want to check how many bytes we wrote in case we
                             // need another go-around
-                            debug!("Responded! {}", fd);
-                            unsafe { libc::close(req.fd.0); };
-                            reqs.remove(&fd);
+                            debug!("Responded! {} {}", fd, e.result());
+                            if req.done() {
+                                unsafe { libc::close(req.fd.0); };
+                                reqs.remove(&fd);
+                            } else {
+                                let send_e = unsafe { req.send() };
+                                to_submit.push(send_e);
+                            }
                             continue;
                         }
+                        debug!("Read event! flags: {} result: {} ud: {}", e.flags(), e.result(), e.user_data());
 
                         // Advance the request internal offset pointer by how many bytes were read
                         // (the result value of the read call)
-                        req.advance(e.result() as usize);
+                        req.advance_read(e.result() as usize);
 
                         // Parse the request and submit any calls to the submission queue
                         let entries = req.serve();
