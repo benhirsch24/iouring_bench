@@ -133,7 +133,7 @@ impl Request {
 
 fn main() -> Result<(), std::io::Error> {
     env_logger::init();
-    let mut uring = IoUring::new(32).expect("io_uring");
+    let mut uring = IoUring::new(1024).expect("io_uring");
 
     // Here's our super simple statically allocated cache
     let mut cache = Rc::new(HashMap::<String, String>::new());
@@ -206,9 +206,10 @@ fn main() -> Result<(), std::io::Error> {
                                 libc::EIO => "eio",
                                 libc::EINVAL => "einval",
                                 libc::EBADF => "ebadf",
+                                104 => "connection reset by peer",
                                 _ => "other",
                             };
-                            error!("Error on fd: {} {} {}", fd, e.result(), error);
+                            error!("Error on fd: {} {} {} {}", fd, e.result(), error, if req.responded { "responded" } else { "started" });
                             unsafe { libc::close(req.fd.0); };
                             reqs.remove(&fd);
                             continue;
