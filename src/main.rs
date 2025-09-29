@@ -199,28 +199,26 @@ fn main() -> Result<(), std::io::Error> {
                             reqs.remove(&fd);
                             continue;
                         }
+                        if e.result() < 0 {
+                            let error = match -e.result() {
+                                libc::EFAULT => "efault",
+                                libc::EPIPE => "epipe",
+                                libc::EIO => "eio",
+                                libc::EINVAL => "einval",
+                                libc::EBADF => "ebadf",
+                                _ => "other",
+                            };
+                            error!("Error on fd: {} {} {}", fd, e.result(), error);
+                            unsafe { libc::close(req.fd.0); };
+                            reqs.remove(&fd);
+                            continue;
+                        }
 
                         // The completion queue returned a successful write response
                         if req.responded {
                             debug!("Write event! flags: {} result: {} ud: {}", e.flags(), e.result(), e.user_data());
-                            if e.result() < 0 {
-                                let error = match -e.result() {
-                                    libc::EFAULT => "efault",
-                                    libc::EPIPE => "epipe",
-                                    libc::EIO => "eio",
-                                    libc::EINVAL => "einval",
-                                    libc::EBADF => "ebadf",
-                                    _ => "other",
-                                };
-                                error!("Error on write: {} {}", e.result(), error);
-                                unsafe { libc::close(req.fd.0); };
-                                reqs.remove(&fd);
-                                continue;
-                            }
                             req.advance_write(e.result().try_into().unwrap());
-                            // TODO: This means no keep-alive
-                            // TODO: Probably also want to check how many bytes we wrote in case we
-                            // need another go-around
+                            // TODO: No keep alive implemented yet
                             debug!("Responded! {} {}", fd, e.result());
                             if req.done() {
                                 unsafe { libc::close(req.fd.0); };
