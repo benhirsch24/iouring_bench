@@ -7,8 +7,8 @@ use std::rc::Rc;
 
 use log::{debug, error, info, warn};
 
-// only support reads of 1KB
 static BUFFER_SIZE : usize = 1024*1024;
+static CHUNK_SIZE : usize = 16384;
 
 const ACCEPT_CODE: u64 = opcode::Accept::CODE as u64;
 const NOT_FOUND: &'static str = "HTTP/1.1 404 Not Found\r\nContent-Length: 8\r\n\r\nNotFound";
@@ -64,10 +64,11 @@ impl Request {
 
     unsafe fn send(&mut self) -> Entry {
         let len = self.response.as_ref().unwrap().len();
-        let byte_clone = (self.response.as_mut().unwrap()).clone();
-        let slice = byte_clone.slice(self.sent..len);
-        let ptr = slice.as_ptr();
-        let to_send : u32 = (len - self.sent) as u32;
+
+        let start = self.sent;
+        let end = if start + CHUNK_SIZE > len { len } else { start + CHUNK_SIZE };
+        let ptr = self.response.as_ref().unwrap().slice(start..end).as_ptr();
+        let to_send : u32 = (end - start) as u32;
         let send_e = opcode::Send::new(self.fd, ptr, to_send);
         return send_e.build().user_data(self.fd.0 as u64).into();
     }
@@ -247,6 +248,7 @@ fn main() -> Result<(), std::io::Error> {
             // Actually submit to submission queue
             for e in to_submit {
                 unsafe {
+                    // TODO: Add backlog if the submission queue is full.
                     uring.submission().push(&e).expect("push read");
                 }
             }

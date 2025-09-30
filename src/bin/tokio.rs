@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use log::{debug};
+use bytes::Bytes;
+use log::{debug, error};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::runtime::Builder;
 use tokio::task::{LocalSet, spawn_local};
 
 static BUFFER_SIZE : usize = 1024*1024;
+static CHUNK_SIZE : usize = 16384;
 const HEALTH_OK: &'static str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
 const NOT_FOUND: &'static str = "HTTP/1.1 404 Not Found\r\nContent-Length: 8\r\n\r\nNotFound";
 const BAD_REQUEST: &'static str = "HTTP/1.1 400 Bad Request\r\nContent-Length: 25\r\n\r\nExpected /object/<object>";
@@ -42,7 +44,8 @@ fn main() -> std::io::Result<()> {
 
                 // Not finished with request, keep reading
                 if !request.is_complete() {
-                    panic!("not complete");
+                    error!("Request not completely read");
+                    return;
                 }
 
                 // We have a request, let's route
@@ -55,7 +58,17 @@ fn main() -> std::io::Result<()> {
                                     stream.write(BAD_REQUEST.as_bytes()).await.unwrap();
                                 } else {
                                     if let Some(o) = cache.get(&parts[2].to_string()) {
-                                        stream.write_all(&format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}", o.len(), o).as_bytes()).await.unwrap();
+                                        // Write out the file in chunks
+                                        let resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}", o.len(), o);
+                                        let bs = Bytes::copy_from_slice(resp.as_bytes());
+                                        let mut start = 0;
+                                        loop {
+                                            let end = if start + CHUNK_SIZE > bs.len() { bs.len() } else { start + CHUNK_SIZE };
+                                            match stream.write(&bs.slice(start..end)).await {
+                                                Ok(n) => { debug!("Wrote {n}"); start += n },
+                                                Err(e) => error!("Did nto write all {}", e)
+                                            };
+                                        }
                                     } else {
                                         stream.write(NOT_FOUND.as_bytes()).await.unwrap();
                                     }
