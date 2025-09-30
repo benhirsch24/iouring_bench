@@ -13,3 +13,9 @@ glommio = "0.9.0"
 futures-lite = "2.6.1"
 bytes = "1.10.1"
 tokio = { version = "1.47.1", features = ["full"] }
+
+[profile.release]
+opt-level = 3
+debug = true          # keep symbols
+lto = "thin"          # optional
+codegen-units = 1     # optional, steadier profiles

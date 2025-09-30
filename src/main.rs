@@ -5,12 +5,15 @@ use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
 
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 
 static BUFFER_SIZE : usize = 1024*1024;
-static CHUNK_SIZE : usize = 16384;
+static CHUNK_SIZE : usize = 4096; //16384;
+static SUBMIT_THRESHOLD : usize = 64;
+static URING_SIZE : u32 = 1024;
 
 const ACCEPT_CODE: u64 = opcode::Accept::CODE as u64;
+const TIMEOUT_CODE: u64 = opcode::Timeout::CODE as u64;
 const NOT_FOUND: &'static str = "HTTP/1.1 404 Not Found\r\nContent-Length: 8\r\n\r\nNotFound";
 const HEALTH_OK: &'static str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
 const SILLY_TEXT: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/silly_text.txt"));
@@ -134,7 +137,7 @@ impl Request {
 
 fn main() -> Result<(), std::io::Error> {
     env_logger::init();
-    let mut uring = IoUring::new(1024).expect("io_uring");
+    let mut uring = IoUring::new(URING_SIZE).expect("io_uring");
 
     // Here's our super simple statically allocated cache
     let mut cache = Rc::new(HashMap::<String, String>::new());
@@ -148,110 +151,177 @@ fn main() -> Result<(), std::io::Error> {
 
     // Map<Fd, Request object>
     let mut reqs = HashMap::new();
+    let mut to_submit = vec![];
+    let mut total_submitted = 0;
+    let mut total_completions = 0;
+    let mut accept_inflight = 0;
+    let mut timeout_inflight = false;
     loop {
-        // Always accept
-        let accept_e = opcode::Accept::new(lfd, &mut sockaddr, &mut addrlen);
-        unsafe {
-            uring.submission().push(&accept_e.build().user_data(ACCEPT_CODE).into()).expect("first push");
+        let mut submitted = 0;
+        let mut completed = 0;
+
+        let submission_available = {
+            let s = uring.submission();
+            s.capacity() - s.len()
+        };
+        let mut should_submit = false;
+        if submission_available <= URING_SIZE.try_into().unwrap() && !timeout_inflight {
+            trace!("Submitting timeout");
+            let ts = types::Timespec::new().sec(10).nsec(0);
+            let timeout = opcode::Timeout::new(&ts as *const types::Timespec)
+                .count(0)
+                .build()
+                .user_data(TIMEOUT_CODE);
+            unsafe { uring.submission().push(&timeout).expect("timeout") };
+            timeout_inflight = true;
+            should_submit = true;
+            submitted += 1;
         }
 
-        // Wait for something
-        uring.submit_and_wait(1)?;
-
-        // Check for completions
-        {
-            uring.completion().sync();
-            let mut to_submit = vec![];
-            for e in uring.completion() {
-                match e.user_data() {
-                    ACCEPT_CODE => {
-                        if e.result() == 127 {
-                            error!("Failed to accept");
-                            continue;
-                        }
-                        info!("Accept! flags: {} result: {} ud: {}", e.flags(), e.result(), e.user_data());
-
-                        // Create a new request object around this file descriptor and enqueue the
-                        // first read
-                        let mut req = Request::new(types::Fd(e.result()), cache.clone());
-                        let re = unsafe { req.read() };
-                        to_submit.push(re);
-                        reqs.insert(e.result(), req);
-                    },
-                    _ => {
-                        // Get the request out of our outstanding requests hashmap
-                        let fd = e.user_data() as i32;
-                        let req = match reqs.get_mut(&fd) {
-                            Some(r) => r,
-                            None => {
-                                warn!("No outstanding request for flags: {} result: {} ud: {}", e.flags(), e.result(), e.user_data());
-                                continue;
-                            },
-                        };
-
-                        if e.result() == -1 {
-                            error!("Request error: {}", req.fd.0);
-                            unsafe { libc::close(req.fd.0); };
-                            reqs.remove(&fd);
-                            continue;
-                        }
-                        if e.result() == 0 {
-                            unsafe { libc::close(req.fd.0); };
-                            reqs.remove(&fd);
-                            continue;
-                        }
-                        if e.result() < 0 {
-                            let error = match -e.result() {
-                                libc::EFAULT => "efault",
-                                libc::EPIPE => "epipe",
-                                libc::EIO => "eio",
-                                libc::EINVAL => "einval",
-                                libc::EBADF => "ebadf",
-                                104 => "connection reset by peer",
-                                _ => "other",
-                            };
-                            error!("Error on fd: {} {} {} {}", fd, e.result(), error, if req.responded { "responded" } else { "started" });
-                            unsafe { libc::close(req.fd.0); };
-                            reqs.remove(&fd);
-                            continue;
-                        }
-
-                        // The completion queue returned a successful write response
-                        if req.responded {
-                            debug!("Write event! flags: {} result: {} ud: {}", e.flags(), e.result(), e.user_data());
-                            req.advance_write(e.result().try_into().unwrap());
-                            // TODO: No keep alive implemented yet
-                            debug!("Responded! {} {}", fd, e.result());
-                            if req.done() {
-                                unsafe { libc::close(req.fd.0); };
-                                reqs.remove(&fd);
-                            } else {
-                                let send_e = unsafe { req.send() };
-                                to_submit.push(send_e);
-                            }
-                            continue;
-                        }
-                        debug!("Read event! flags: {} result: {} ud: {}", e.flags(), e.result(), e.user_data());
-
-                        // Advance the request internal offset pointer by how many bytes were read
-                        // (the result value of the read call)
-                        req.advance_read(e.result() as usize);
-
-                        // Parse the request and submit any calls to the submission queue
-                        let entries = req.serve();
-                        for e in entries {
-                            to_submit.push(e);
-                        }
-                    },
-                }
+        // Keep ~8 accepts in flight at all times
+        // TODO: Multishot accept
+        let accept_gap = 8 - accept_inflight;
+        let submission_available = {
+            let s = uring.submission();
+            s.capacity() - s.len()
+        };
+        if submission_available >= accept_gap {
+            trace!("Submitting {} accepts avail={submission_available}", accept_gap);
+            should_submit = should_submit || (accept_inflight == 0);
+            for _ in 0..accept_gap {
+                accept_inflight += 1;
+                let accept_e = opcode::Accept::new(lfd, &mut sockaddr, &mut addrlen).build().user_data(ACCEPT_CODE);
+                unsafe { uring.submission().push(&accept_e).expect("push accept") };
             }
-            // Actually submit to submission queue
-            for e in to_submit {
+        }
+
+        // TODO: In production we'd probably want to manage the queue if it was growing faster than
+        // we cleared it. Eg we could be doing LIFO and abandon early requests that have stayed in
+        // the queue, etc.
+        //
+        // If there are events to submit add them to the submission queue up to the uring
+        // submission queue size.
+        let submission_available = {
+            let s = uring.submission();
+            s.capacity() - s.len()
+        };
+        if to_submit.len() > 0 && submission_available > 0 {
+            let num_to_submit = std::cmp::min(to_submit.len(), submission_available);
+            for _ in 0..num_to_submit {
+                let e = to_submit.pop().unwrap();
                 unsafe {
                     // TODO: Add backlog if the submission queue is full.
-                    uring.submission().push(&e).expect("push read");
+                    uring.submission().push(&e).expect("push");
                 }
+                total_submitted += 1;
+                submitted += 1;
             }
+        }
+
+        // If there are events in the submission queue call the non-blocking submit method.
+        if should_submit || uring.submission().len() > SUBMIT_THRESHOLD {
+            let n = uring.submit().unwrap();
+            debug!("Submit should_submit={should_submit} submitted={n}");
+        }
+
+        // Check for completions
+        uring.completion().sync();
+        for e in uring.completion() {
+            total_completions += 1;
+            completed += 1;
+            match e.user_data() {
+                TIMEOUT_CODE => {
+                    timeout_inflight = false;
+                    info!("Metrics: total_submitted={total_submitted} total_completed={total_completions} backlog={}", to_submit.len());
+                },
+                ACCEPT_CODE => {
+                    accept_inflight -= 1;
+                    if e.result() == 127 {
+                        error!("Failed to accept");
+                        continue;
+                    }
+                    trace!("Accept! flags: {} result: {} ud: {}", e.flags(), e.result(), e.user_data());
+
+                    // Create a new request object around this file descriptor and enqueue the
+                    // first read
+                    let mut req = Request::new(types::Fd(e.result()), cache.clone());
+                    let re = unsafe { req.read() };
+                    to_submit.push(re);
+                    reqs.insert(e.result(), req);
+                },
+                _ => {
+                    // Get the request out of our outstanding requests hashmap
+                    let fd = e.user_data() as i32;
+                    let req = match reqs.get_mut(&fd) {
+                        Some(r) => r,
+                        None => {
+                            warn!("No outstanding request for flags: {} result: {} ud: {}", e.flags(), e.result(), e.user_data());
+                            continue;
+                        },
+                    };
+
+                    if e.result() == -1 {
+                        error!("Request error: {}", req.fd.0);
+                        unsafe { libc::close(req.fd.0); };
+                        reqs.remove(&fd);
+                        continue;
+                    }
+                    if e.result() == 0 {
+                        unsafe { libc::close(req.fd.0); };
+                        reqs.remove(&fd);
+                        continue;
+                    }
+                    if e.result() < 0 {
+                        let error = match -e.result() {
+                            libc::EFAULT => "efault",
+                            libc::EPIPE => "epipe",
+                            libc::EIO => "eio",
+                            libc::EINVAL => "einval",
+                            libc::EBADF => "ebadf",
+                            104 => "connection reset by peer",
+                            _ => "other",
+                        };
+                        error!("Error on fd: {} {} {} {}", fd, e.result(), error, if req.responded { "responded" } else { "started" });
+                        unsafe { libc::close(req.fd.0); };
+                        reqs.remove(&fd);
+                        continue;
+                    }
+
+                    // The completion queue returned a successful write response
+                    if req.responded {
+                        trace!("Write event! flags: {} result: {} ud: {}", e.flags(), e.result(), e.user_data());
+                        req.advance_write(e.result().try_into().unwrap());
+                        // TODO: No keep alive implemented yet
+                        if req.done() {
+                            unsafe { libc::close(req.fd.0); };
+                            reqs.remove(&fd);
+                        } else {
+                            let send_e = unsafe { req.send() };
+                            to_submit.push(send_e);
+                        }
+                        continue;
+                    }
+                    trace!("Read event! flags: {} result: {} ud: {}", e.flags(), e.result(), e.user_data());
+
+                    // Advance the request internal offset pointer by how many bytes were read
+                    // (the result value of the read call)
+                    req.advance_read(e.result() as usize);
+
+                    // Parse the request and submit any calls to the submission queue
+                    let entries = req.serve();
+                    for e in entries {
+                        to_submit.push(e);
+                    }
+                },
+            }
+        }
+
+        trace!("Metrics: submitted={submitted} completed={completed}");
+
+        // If the submission queue is empty and the completion queue is empty, then submit and wait
+        // for something to happen
+        if submitted == 0 && completed == 0 {
+            uring.submit_and_wait(1)?;
         }
     }
     Ok(())

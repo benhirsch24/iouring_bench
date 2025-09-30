@@ -9,7 +9,7 @@ use tokio::runtime::Builder;
 use tokio::task::{LocalSet, spawn_local};
 
 static BUFFER_SIZE : usize = 1024*1024;
-static CHUNK_SIZE : usize = 16384;
+static CHUNK_SIZE : usize = 4096; //16384;
 const HEALTH_OK: &'static str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
 const NOT_FOUND: &'static str = "HTTP/1.1 404 Not Found\r\nContent-Length: 8\r\n\r\nNotFound";
 const BAD_REQUEST: &'static str = "HTTP/1.1 400 Bad Request\r\nContent-Length: 25\r\n\r\nExpected /object/<object>";
