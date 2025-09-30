@@ -9,8 +9,6 @@ use std::rc::Rc;
 use log::{debug, error, info, trace, warn};
 
 static BUFFER_SIZE : usize = 1024*1024;
-static SUBMIT_THRESHOLD : usize = 64;
-static URING_SIZE : u32 = 1024;
 
 const ACCEPT_CODE: u64 = opcode::Accept::CODE as u64;
 const TIMEOUT_CODE: u64 = opcode::Timeout::CODE as u64;
@@ -143,13 +141,21 @@ struct Args {
     /// Chunk size to send the file in chunks of
     #[arg(short, long, default_value_t = 4096)]
     chunk_size: usize,
+
+    /// Size of uring submission queue
+    #[arg(short, long, default_value_t = 1024)]
+    uring_size: u32,
+
+    /// Number of submissions in the backlog before submitting to uring
+    #[arg(short, long, default_value_t = 64)]
+    submissions_threshold: usize,
 }
 
 fn main() -> Result<(), std::io::Error> {
     env_logger::init();
     let args = Args::parse();
     info!("Using chunk size {}", args.chunk_size);
-    let mut uring = IoUring::new(URING_SIZE).expect("io_uring");
+    let mut uring = IoUring::new(args.uring_size).expect("io_uring");
 
     // Here's our super simple statically allocated cache
     let mut cache = Rc::new(HashMap::<String, String>::new());
@@ -177,7 +183,7 @@ fn main() -> Result<(), std::io::Error> {
             s.capacity() - s.len()
         };
         let mut should_submit = false;
-        if submission_available <= URING_SIZE.try_into().unwrap() && !timeout_inflight {
+        if submission_available <= args.uring_size.try_into().unwrap() && !timeout_inflight {
             trace!("Submitting timeout");
             let ts = types::Timespec::new().sec(10).nsec(0);
             let timeout = opcode::Timeout::new(&ts as *const types::Timespec)
@@ -231,7 +237,7 @@ fn main() -> Result<(), std::io::Error> {
         }
 
         // If there are events in the submission queue call the non-blocking submit method.
-        if should_submit || uring.submission().len() > SUBMIT_THRESHOLD {
+        if should_submit || uring.submission().len() > args.submissions_threshold {
             let n = uring.submit().unwrap();
             debug!("Submit should_submit={should_submit} submitted={n}");
         }
