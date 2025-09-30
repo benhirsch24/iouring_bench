@@ -63,6 +63,9 @@ fn main() -> std::io::Result<()> {
                                         let bs = Bytes::copy_from_slice(resp.as_bytes());
                                         let mut start = 0;
                                         loop {
+                                            if start == bs.len() {
+                                                return;
+                                            }
                                             let end = if start + CHUNK_SIZE > bs.len() { bs.len() } else { start + CHUNK_SIZE };
                                             match stream.write(&bs.slice(start..end)).await {
                                                 Ok(n) => { debug!("Wrote {n}"); start += n },
