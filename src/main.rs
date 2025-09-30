@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use clap::{Parser};
 use io_uring::{IoUring, opcode, squeue::Entry, types};
 
 use std::collections::HashMap;
@@ -8,7 +9,6 @@ use std::rc::Rc;
 use log::{debug, error, info, trace, warn};
 
 static BUFFER_SIZE : usize = 1024*1024;
-static CHUNK_SIZE : usize = 4096; //16384;
 static SUBMIT_THRESHOLD : usize = 64;
 static URING_SIZE : u32 = 1024;
 
@@ -26,10 +26,11 @@ struct Request {
     responded: bool,
     cache: Rc<HashMap<String, String>>,
     sent: usize,
+    chunk_size: usize,
 }
 
 impl Request {
-    fn new(fd: types::Fd, cache: Rc<HashMap<String, String>>) -> Request {
+    fn new(fd: types::Fd, cache: Rc<HashMap<String, String>>, chunk_size: usize) -> Request {
         Request {
             fd,
             buffer: vec![0u8; BUFFER_SIZE],
@@ -38,6 +39,7 @@ impl Request {
             responded: false,
             cache,
             sent: 0,
+            chunk_size,
         }
     }
 
@@ -69,7 +71,7 @@ impl Request {
         let len = self.response.as_ref().unwrap().len();
 
         let start = self.sent;
-        let end = if start + CHUNK_SIZE > len { len } else { start + CHUNK_SIZE };
+        let end = if start + self.chunk_size > len { len } else { start + self.chunk_size };
         let ptr = self.response.as_ref().unwrap().slice(start..end).as_ptr();
         let to_send : u32 = (end - start) as u32;
         let send_e = opcode::Send::new(self.fd, ptr, to_send);
@@ -135,8 +137,18 @@ impl Request {
     }
 }
 
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Chunk size to send the file in chunks of
+    #[arg(short, long, default_value_t = 4096)]
+    chunk_size: usize,
+}
+
 fn main() -> Result<(), std::io::Error> {
     env_logger::init();
+    let args = Args::parse();
+    info!("Using chunk size {}", args.chunk_size);
     let mut uring = IoUring::new(URING_SIZE).expect("io_uring");
 
     // Here's our super simple statically allocated cache
@@ -244,7 +256,7 @@ fn main() -> Result<(), std::io::Error> {
 
                     // Create a new request object around this file descriptor and enqueue the
                     // first read
-                    let mut req = Request::new(types::Fd(e.result()), cache.clone());
+                    let mut req = Request::new(types::Fd(e.result()), cache.clone(), args.chunk_size);
                     let re = unsafe { req.read() };
                     to_submit.push(re);
                     reqs.insert(e.result(), req);
