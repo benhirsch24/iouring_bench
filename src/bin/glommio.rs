@@ -2,12 +2,14 @@ use std::collections::HashMap;
 use std::io::Result;
 use std::rc::Rc;
 
+use bytes::Bytes;
+use clap::{Parser};
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use glommio::{
     prelude::*,
     net::{TcpListener},
 };
-use log::{info};
+use log::{debug, error, info, warn};
 
 static BUFFER_SIZE : usize = 1024*1024;
 const HEALTH_OK: &'static str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
@@ -15,10 +17,20 @@ const NOT_FOUND: &'static str = "HTTP/1.1 404 Not Found\r\nContent-Length: 8\r\n
 const BAD_REQUEST: &'static str = "HTTP/1.1 400 Bad Request\r\nContent-Length: 25\r\n\r\nExpected /object/<object>";
 const SILLY_TEXT: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/silly_text.txt"));
 
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Chunk size to send the file in chunks of
+    #[arg(short, long, default_value_t = 4096)]
+    chunk_size: usize,
+}
+
 fn main() -> Result<()> {
     env_logger::init();
+    let args = Args::parse();
+    info!("Using chunk size {}", args.chunk_size);
     let builder = LocalExecutorBuilder::new(Placement::Fixed(1));
-    let handle = builder.name("server").spawn(|| async move {
+    let handle = builder.name("server").spawn(move || async move {
         let mut cache = Rc::new(HashMap::new());
         Rc::get_mut(&mut cache).unwrap().insert("1".to_string(), SILLY_TEXT.to_string());
 
@@ -39,7 +51,8 @@ fn main() -> Result<()> {
 
                 // Not finished with request, keep reading
                 if !request.is_complete() {
-                    panic!("not complete");
+                    warn!("request not complete");
+                    return;
                 }
 
                 // We have a request, let's route
@@ -52,7 +65,19 @@ fn main() -> Result<()> {
                                     stream.write(BAD_REQUEST.as_bytes()).await.unwrap();
                                 } else {
                                     if let Some(o) = cache.get(&parts[2].to_string()) {
-                                        stream.write(&format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}", o.len(), o).as_bytes()).await.unwrap();
+                                        let resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}", o.len(), o);
+                                        let bs = Bytes::copy_from_slice(resp.as_bytes());
+                                        let mut start = 0;
+                                        loop {
+                                            if start == bs.len() {
+                                                return;
+                                            }
+                                            let end = if start + args.chunk_size > bs.len() { bs.len() } else { start + args.chunk_size };
+                                            match stream.write(&bs.slice(start..end)).await {
+                                                Ok(n) => { debug!("Wrote {n}"); start += n },
+                                                Err(e) => error!("Did nto write all {}", e)
+                                            };
+                                        }
                                     } else {
                                         stream.write(NOT_FOUND.as_bytes()).await.unwrap();
                                     }

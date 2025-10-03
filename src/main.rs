@@ -149,13 +149,22 @@ struct Args {
     /// Number of submissions in the backlog before submitting to uring
     #[arg(short, long, default_value_t = 64)]
     submissions_threshold: usize,
+
+    /// Interval for kernel submission queue polling. If 0 then sqpoll is disabled. Default 0.
+    #[arg(short = 'i', long, default_value_t = 0)]
+    sqpoll_interval_ms: u32,
 }
 
 fn main() -> Result<(), std::io::Error> {
     env_logger::init();
     let args = Args::parse();
     info!("Using chunk size {}", args.chunk_size);
-    let mut uring = IoUring::new(args.uring_size).expect("io_uring");
+    let mut uring: IoUring<io_uring::squeue::Entry, io_uring::cqueue::Entry> = if args.sqpoll_interval_ms > 0 {
+        IoUring::builder().setup_sqpoll(args.sqpoll_interval_ms).build(args.uring_size).expect("uring")
+    } else {
+        IoUring::builder().build(args.uring_size).expect("uring")
+    };
+    let uring_usize : usize = args.uring_size.try_into().unwrap();
 
     // Here's our super simple statically allocated cache
     let mut cache = Rc::new(HashMap::<String, String>::new());
@@ -170,10 +179,13 @@ fn main() -> Result<(), std::io::Error> {
     // Map<Fd, Request object>
     let mut reqs = HashMap::new();
     let mut to_submit = vec![];
-    let mut total_submitted = 0;
-    let mut total_completions = 0;
+    let mut submitted_last_period = 0;
+    let mut completions_last_period = 0;
     let mut accept_inflight = 0;
     let mut timeout_inflight = false;
+    let mut submit_and_wait = 0;
+    let ts = types::Timespec::new().sec(10).nsec(0);
+    let mut last_submit = std::time::Instant::now();
     loop {
         let mut submitted = 0;
         let mut completed = 0;
@@ -182,17 +194,14 @@ fn main() -> Result<(), std::io::Error> {
             let s = uring.submission();
             s.capacity() - s.len()
         };
-        let mut should_submit = false;
-        if submission_available <= args.uring_size.try_into().unwrap() && !timeout_inflight {
+        if submission_available <= uring_usize && !timeout_inflight {
             trace!("Submitting timeout");
-            let ts = types::Timespec::new().sec(10).nsec(0);
             let timeout = opcode::Timeout::new(&ts as *const types::Timespec)
                 .count(0)
                 .build()
                 .user_data(TIMEOUT_CODE);
             unsafe { uring.submission().push(&timeout).expect("timeout") };
             timeout_inflight = true;
-            should_submit = true;
             submitted += 1;
         }
 
@@ -205,7 +214,6 @@ fn main() -> Result<(), std::io::Error> {
         };
         if submission_available >= accept_gap {
             trace!("Submitting {} accepts avail={submission_available}", accept_gap);
-            should_submit = should_submit || (accept_inflight == 0);
             for _ in 0..accept_gap {
                 accept_inflight += 1;
                 let accept_e = opcode::Accept::new(lfd, &mut sockaddr, &mut addrlen).build().user_data(ACCEPT_CODE);
@@ -213,10 +221,6 @@ fn main() -> Result<(), std::io::Error> {
             }
         }
 
-        // TODO: In production we'd probably want to manage the queue if it was growing faster than
-        // we cleared it. Eg we could be doing LIFO and abandon early requests that have stayed in
-        // the queue, etc.
-        //
         // If there are events to submit add them to the submission queue up to the uring
         // submission queue size.
         let submission_available = {
@@ -231,26 +235,26 @@ fn main() -> Result<(), std::io::Error> {
                     // TODO: Add backlog if the submission queue is full.
                     uring.submission().push(&e).expect("push");
                 }
-                total_submitted += 1;
+                submitted_last_period += 1;
                 submitted += 1;
             }
-        }
-
-        // If there are events in the submission queue call the non-blocking submit method.
-        if should_submit || uring.submission().len() > args.submissions_threshold {
-            let n = uring.submit().unwrap();
-            debug!("Submit should_submit={should_submit} submitted={n}");
         }
 
         // Check for completions
         uring.completion().sync();
         for e in uring.completion() {
-            total_completions += 1;
+            completions_last_period += 1;
             completed += 1;
             match e.user_data() {
                 TIMEOUT_CODE => {
+                    if e.result() < 0 {
+                        warn!("Timeout result <0 {}", e.result());
+                    }
                     timeout_inflight = false;
-                    info!("Metrics: total_submitted={total_submitted} total_completed={total_completions} backlog={}", to_submit.len());
+                    info!("Metrics: submitted_last_period={submitted_last_period} completions_last_period={completions_last_period} submit_and_wait={submit_and_wait} backlog={}", to_submit.len());
+                    submitted_last_period = 0;
+                    completions_last_period = 0;
+                    submit_and_wait = 0;
                 },
                 ACCEPT_CODE => {
                     accept_inflight -= 1;
@@ -334,11 +338,20 @@ fn main() -> Result<(), std::io::Error> {
             }
         }
 
+        // If there are events in the submission queue call the non-blocking submit method.
+        if uring.submission().len() > args.submissions_threshold {
+            let n = uring.submit().unwrap();
+            last_submit = std::time::Instant::now();
+            debug!("Submit submitted={n}");
+        }
+
         trace!("Metrics: submitted={submitted} completed={completed}");
 
         // If the submission queue is empty and the completion queue is empty, then submit and wait
         // for something to happen
-        if submitted == 0 && completed == 0 {
+        if (to_submit.len() == 0 && completed == 0) || (args.sqpoll_interval_ms > 0 && last_submit.elapsed().as_millis() > args.sqpoll_interval_ms.into()) {
+            submit_and_wait += 1;
+            last_submit = std::time::Instant::now();
             uring.submit_and_wait(1)?;
         }
     }

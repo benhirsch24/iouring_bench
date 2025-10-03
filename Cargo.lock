@@ -476,7 +476,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "iouring_cache"
+name = "iouring_bench"
 version = "0.1.0"
 dependencies = [
  "bytes",
