@@ -1,12 +1,13 @@
 use bytes::Bytes;
 use clap::{Parser};
 use io_uring::{IoUring, opcode, squeue::Entry, types};
+use histogram::Histogram;
+use log::{debug, error, info, trace, warn};
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
-
-use log::{debug, error, info, trace, warn};
 
 static BUFFER_SIZE : usize = 1024*1024;
 
@@ -25,10 +26,12 @@ struct Request {
     cache: Rc<HashMap<String, String>>,
     sent: usize,
     chunk_size: usize,
+    write_timing_histogram: Rc<RefCell<Histogram>>,
+    last_write: Option<std::time::Instant>,
 }
 
 impl Request {
-    fn new(fd: types::Fd, cache: Rc<HashMap<String, String>>, chunk_size: usize) -> Request {
+    fn new(fd: types::Fd, cache: Rc<HashMap<String, String>>, write_timing_histogram: Rc<RefCell<Histogram>>, chunk_size: usize) -> Request {
         Request {
             fd,
             buffer: vec![0u8; BUFFER_SIZE],
@@ -38,6 +41,8 @@ impl Request {
             cache,
             sent: 0,
             chunk_size,
+            write_timing_histogram,
+            last_write: None,
         }
     }
 
@@ -73,6 +78,13 @@ impl Request {
         let ptr = self.response.as_ref().unwrap().slice(start..end).as_ptr();
         let to_send : u32 = (end - start) as u32;
         let send_e = opcode::Send::new(self.fd, ptr, to_send);
+
+        // Stats on time between writes
+        if let Some(n) = self.last_write {
+            self.write_timing_histogram.borrow_mut().increment(n.elapsed().as_micros() as u64).expect("increment");
+        }
+        self.last_write = Some(std::time::Instant::now());
+
         return send_e.build().user_data(self.fd.0 as u64).into();
     }
 
@@ -143,11 +155,11 @@ struct Args {
     chunk_size: usize,
 
     /// Size of uring submission queue
-    #[arg(short, long, default_value_t = 1024)]
+    #[arg(short, long, default_value_t = 4096)]
     uring_size: u32,
 
     /// Number of submissions in the backlog before submitting to uring
-    #[arg(short, long, default_value_t = 64)]
+    #[arg(short, long, default_value_t = 1024)]
     submissions_threshold: usize,
 
     /// Interval for kernel submission queue polling. If 0 then sqpoll is disabled. Default 0.
@@ -158,87 +170,50 @@ struct Args {
 fn main() -> Result<(), std::io::Error> {
     env_logger::init();
     let args = Args::parse();
-    info!("Using chunk size {}", args.chunk_size);
+    info!("{args:?}");
     let mut uring: IoUring<io_uring::squeue::Entry, io_uring::cqueue::Entry> = if args.sqpoll_interval_ms > 0 {
-        IoUring::builder().setup_sqpoll(args.sqpoll_interval_ms).build(args.uring_size).expect("uring")
+        IoUring::builder()
+            .setup_cqsize(args.uring_size*2)
+            .setup_sqpoll(args.sqpoll_interval_ms)
+            .build(args.uring_size).expect("uring")
     } else {
-        IoUring::builder().build(args.uring_size).expect("uring")
+        IoUring::builder()
+            .setup_cqsize(args.uring_size*2)
+            .build(args.uring_size).expect("uring")
     };
-    let uring_usize : usize = args.uring_size.try_into().unwrap();
 
     // Here's our super simple statically allocated cache
     let mut cache = Rc::new(HashMap::<String, String>::new());
     Rc::get_mut(&mut cache).unwrap().insert("1".to_string(), SILLY_TEXT.to_string());
+    let write_timing_histogram = Rc::new(RefCell::new(Histogram::new(7, 64).expect("histogram")));
+    let mut submit_and_wait_batch_size = Histogram::new(7, 64).expect("sawbs histo");
 
     let listener = std::net::TcpListener::bind("0.0.0.0:8080").expect("tcp listener");
     let listener_fd = listener.as_raw_fd();
     let lfd = types::Fd(listener_fd);
-    let mut sockaddr: libc::sockaddr = unsafe { std::mem::zeroed() };
-    let mut addrlen: libc::socklen_t = std::mem::size_of::<libc::sockaddr>() as _;
-
-    // Map<Fd, Request object>
     let mut reqs = HashMap::new();
     let mut to_submit = vec![];
     let mut submitted_last_period = 0;
     let mut completions_last_period = 0;
-    let mut accept_inflight = 0;
-    let mut timeout_inflight = false;
     let mut submit_and_wait = 0;
-    let ts = types::Timespec::new().sec(10).nsec(0);
+    let ts = types::Timespec::new().sec(5).nsec(0);
     let mut last_submit = std::time::Instant::now();
+
+    // Arm multi-shot accept so we don't have to continually resubmit
+    let accept_e = opcode::AcceptMulti::new(lfd).build().user_data(ACCEPT_CODE);
+    unsafe { uring.submission().push(&accept_e).expect("push accept") };
+    // Add the first timeout
+    let timeout = opcode::Timeout::new(&ts as *const types::Timespec)
+        .flags(io_uring::types::TimeoutFlags::MULTISHOT)
+        .count(0)
+        .build()
+        .user_data(TIMEOUT_CODE);
+    unsafe { uring.submission().push(&timeout).expect("timeout") };
+    uring.submit().expect("First submit");
+    debug!("Multishot accept armed");
+
     loop {
-        let mut submitted = 0;
         let mut completed = 0;
-
-        let submission_available = {
-            let s = uring.submission();
-            s.capacity() - s.len()
-        };
-        if submission_available <= uring_usize && !timeout_inflight {
-            trace!("Submitting timeout");
-            let timeout = opcode::Timeout::new(&ts as *const types::Timespec)
-                .count(0)
-                .build()
-                .user_data(TIMEOUT_CODE);
-            unsafe { uring.submission().push(&timeout).expect("timeout") };
-            timeout_inflight = true;
-            submitted += 1;
-        }
-
-        // Keep ~8 accepts in flight at all times
-        // TODO: Multishot accept
-        let accept_gap = 8 - accept_inflight;
-        let submission_available = {
-            let s = uring.submission();
-            s.capacity() - s.len()
-        };
-        if submission_available >= accept_gap {
-            trace!("Submitting {} accepts avail={submission_available}", accept_gap);
-            for _ in 0..accept_gap {
-                accept_inflight += 1;
-                let accept_e = opcode::Accept::new(lfd, &mut sockaddr, &mut addrlen).build().user_data(ACCEPT_CODE);
-                unsafe { uring.submission().push(&accept_e).expect("push accept") };
-            }
-        }
-
-        // If there are events to submit add them to the submission queue up to the uring
-        // submission queue size.
-        let submission_available = {
-            let s = uring.submission();
-            s.capacity() - s.len()
-        };
-        if to_submit.len() > 0 && submission_available > 0 {
-            let num_to_submit = std::cmp::min(to_submit.len(), submission_available);
-            for _ in 0..num_to_submit {
-                let e = to_submit.pop().unwrap();
-                unsafe {
-                    // TODO: Add backlog if the submission queue is full.
-                    uring.submission().push(&e).expect("push");
-                }
-                submitted_last_period += 1;
-                submitted += 1;
-            }
-        }
 
         // Check for completions
         uring.completion().sync();
@@ -247,17 +222,30 @@ fn main() -> Result<(), std::io::Error> {
             completed += 1;
             match e.user_data() {
                 TIMEOUT_CODE => {
-                    if e.result() < 0 {
-                        warn!("Timeout result <0 {}", e.result());
+                    if e.result() != -62 {
+                        warn!("Timeout result not 62: {}", e.result());
                     }
-                    timeout_inflight = false;
+
                     info!("Metrics: submitted_last_period={submitted_last_period} completions_last_period={completions_last_period} submit_and_wait={submit_and_wait} backlog={}", to_submit.len());
+
+                    info!("submit_and_wait batch sizes");
+                    let percentiles = [0.0, 50.0, 90.0, 99.0, 99.9, 99.99, 100.0];
+                    if let Some(ps) = submit_and_wait_batch_size.percentiles(&percentiles).expect("saw percentiles") {
+                        for p in ps {
+                            info!("p{} range={:?} count={}", p.0, p.1.range(), p.1.count());
+                        }
+                    }
+
+                    let percentiles = [0.0, 50.0, 90.0, 99.0, 100.0];
+                    if let Some(ps) = write_timing_histogram.borrow().percentiles(&percentiles).expect("percentiles") {
+                        debug!("Median time betwen writes for a request={}", ps[1].1.count());
+                    }
+
                     submitted_last_period = 0;
                     completions_last_period = 0;
                     submit_and_wait = 0;
                 },
                 ACCEPT_CODE => {
-                    accept_inflight -= 1;
                     if e.result() == 127 {
                         error!("Failed to accept");
                         continue;
@@ -266,7 +254,7 @@ fn main() -> Result<(), std::io::Error> {
 
                     // Create a new request object around this file descriptor and enqueue the
                     // first read
-                    let mut req = Request::new(types::Fd(e.result()), cache.clone(), args.chunk_size);
+                    let mut req = Request::new(types::Fd(e.result()), cache.clone(), write_timing_histogram.clone(), args.chunk_size);
                     let re = unsafe { req.read() };
                     to_submit.push(re);
                     reqs.insert(e.result(), req);
@@ -338,18 +326,26 @@ fn main() -> Result<(), std::io::Error> {
             }
         }
 
-        // If there are events in the submission queue call the non-blocking submit method.
-        if uring.submission().len() > args.submissions_threshold {
-            let n = uring.submit().unwrap();
+        // Submit N batches of size threshold
+        let num_batches = to_submit.len() / args.submissions_threshold;
+        for _ in 0..num_batches {
+            let batch: Vec<io_uring::squeue::Entry> = to_submit.drain(0..args.submissions_threshold).collect();
+            unsafe { uring.submission().push_multiple(&batch) }.expect("push multiple");
+            uring.submit().expect("Submitted");
             last_submit = std::time::Instant::now();
-            debug!("Submit submitted={n}");
+            submitted_last_period += 1;
         }
 
-        trace!("Metrics: submitted={submitted} completed={completed}");
-
-        // If the submission queue is empty and the completion queue is empty, then submit and wait
-        // for something to happen
-        if (to_submit.len() == 0 && completed == 0) || (args.sqpoll_interval_ms > 0 && last_submit.elapsed().as_millis() > args.sqpoll_interval_ms.into()) {
+        // Submit and wait for a completion when:
+        // 1. We're in SQPOLL mode and we haven't submitted in over the interval, so the kernel
+        //    thread may have returned.
+        // 2. We haven't submitted in some period of time because we haven't hit the batch threshold
+        let should_sqpoll_submit = args.sqpoll_interval_ms > 0 && last_submit.elapsed().as_millis() > args.sqpoll_interval_ms.into();
+        if should_sqpoll_submit || completed == 0 {
+            let batch: Vec<io_uring::squeue::Entry> = to_submit.drain(..).collect();
+            unsafe { uring.submission().push_multiple(&batch) }.expect("push multiple");
+            debug!("Submit and wait last_submit={} backlog={} batch_size={} t_diff={}", last_submit.elapsed().as_millis(), to_submit.len(), batch.len(), last_submit.elapsed().as_micros());
+            submit_and_wait_batch_size.increment(batch.len() as u64).unwrap();
             submit_and_wait += 1;
             last_submit = std::time::Instant::now();
             uring.submit_and_wait(1)?;
