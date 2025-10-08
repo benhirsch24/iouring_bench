@@ -1,6 +1,5 @@
-use bytes::Bytes;
 use clap::{Parser};
-use io_uring::{IoUring, opcode, squeue::Entry, types};
+use io_uring::{IoUring, opcode, types};
 use histogram::Histogram;
 use log::{debug, error, info, trace, warn};
 
@@ -12,143 +11,10 @@ use std::rc::Rc;
 pub mod user_data;
 use user_data::{Op, UserData};
 
-static BUFFER_SIZE : usize = 1024*1024;
+pub mod request;
+use request::*;
 
-const NOT_FOUND: &'static str = "HTTP/1.1 404 Not Found\r\nContent-Length: 8\r\n\r\nNotFound";
-const HEALTH_OK: &'static str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
 const SILLY_TEXT: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/silly_text.txt"));
-
-struct Request {
-    fd: types::Fd,
-    buffer: Vec<u8>,
-    filled: usize,
-    response: Option<Bytes>,
-    responded: bool,
-    cache: Rc<HashMap<String, String>>,
-    sent: usize,
-    chunk_size: usize,
-    write_timing_histogram: Rc<RefCell<Histogram>>,
-    last_write: Option<std::time::Instant>,
-}
-
-impl Request {
-    fn new(fd: types::Fd, cache: Rc<HashMap<String, String>>, write_timing_histogram: Rc<RefCell<Histogram>>, chunk_size: usize) -> Request {
-        Request {
-            fd,
-            buffer: vec![0u8; BUFFER_SIZE],
-            filled: 0,
-            response: None,
-            responded: false,
-            cache,
-            sent: 0,
-            chunk_size,
-            write_timing_histogram,
-            last_write: None,
-        }
-    }
-
-    unsafe fn read(&mut self) -> Entry {
-        let ptr = unsafe { self.buffer.as_mut_ptr().add(self.filled) };
-        let read_e = opcode::Recv::new(self.fd, ptr, (BUFFER_SIZE - self.filled) as u32);
-        let ud = UserData::new(Op::Recv, self.fd.0);
-        return read_e.build().user_data(ud.into_u64()).into();
-    }
-
-    fn advance_read(&mut self, n: usize) {
-        self.filled += n;
-    }
-
-    fn advance_write(&mut self, n: usize) {
-        self.sent += n;
-    }
-
-    fn done(&self) -> bool {
-        self.sent == self.response.as_ref().unwrap().len()
-    }
-
-    fn set_response(&mut self, resp: &str) {
-        // Store response in this request as it needs to be allocated until the kernel has sent it
-        // Eventually this could be a pointer to kernel owned buffer
-        self.response = Some(Bytes::copy_from_slice(resp.as_bytes()));
-    }
-
-    unsafe fn send(&mut self) -> Entry {
-        let len = self.response.as_ref().unwrap().len();
-
-        let start = self.sent;
-        let end = if start + self.chunk_size > len { len } else { start + self.chunk_size };
-        let ptr = self.response.as_ref().unwrap().slice(start..end).as_ptr();
-        let to_send : u32 = (end - start) as u32;
-        let send_e = opcode::Send::new(self.fd, ptr, to_send);
-        let ud = UserData::new(Op::Send, self.fd.0);
-
-        // Stats on time between writes
-        if let Some(n) = self.last_write {
-            self.write_timing_histogram.borrow_mut().increment(n.elapsed().as_micros() as u64).expect("increment");
-        }
-        self.last_write = Some(std::time::Instant::now());
-
-        return send_e.build().user_data(ud.into_u64()).into();
-    }
-
-    fn serve(&mut self) -> Vec<Entry> {
-        let mut headers = [httparse::EMPTY_HEADER; 16];
-        let mut r = httparse::Request::new(headers.as_mut_slice());
-        let request = r.parse(&self.buffer[..self.filled]).expect("parse error");
-        let mut sqe = Vec::new();
-
-        // Not finished with request, keep reading
-        if !request.is_complete() {
-            let e = unsafe { self.read() };
-            sqe.push(e);
-            return sqe;
-        }
-
-        // We have a request, let's route
-        match r.path {
-            Some(path) => {
-                match path {
-                    p if p.starts_with("/object") => {
-                        let parts = p.split("/").collect::<Vec<_>>();
-                        if parts.len() != 3 {
-                            self.set_response(&format!("HTTP/1.1 400 Bad Request\r\nContent-Length: 25\r\n\r\nExpected /object/<object>"));
-                            let send = unsafe { self.send() };
-                            sqe.push(send);
-                        } else {
-                            if let Some(o) = self.cache.get(&parts[2].to_string()) {
-                                self.set_response(&format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}", o.len(), o));
-                                let send = unsafe { self.send() };
-                                sqe.push(send);
-                            } else {
-                                self.set_response(NOT_FOUND);
-                                let send = unsafe { self.send() };
-                                sqe.push(send);
-                            }
-                        }
-                    },
-                    "/health" => {
-                        self.set_response(HEALTH_OK);
-                        let send = unsafe { self.send() };
-                        sqe.push(send);
-                    },
-                    _ => {
-                        self.set_response(NOT_FOUND);
-                        let send = unsafe { self.send() };
-                        sqe.push(send);
-                    }
-                }
-            },
-            None => {
-                self.set_response(NOT_FOUND);
-                let send = unsafe { self.send() };
-                sqe.push(send);
-            }
-        }
-
-        self.responded = true;
-        sqe
-    }
-}
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -228,7 +94,8 @@ fn main() -> Result<(), std::io::Error> {
             trace!("completion result={} ud={}", e.result(), e.user_data());
             let ud = UserData::try_from(e.user_data()).expect("failed userdata extract");
             let fd = ud.fd();
-            match ud.op().expect("op") {
+            let op = ud.op().expect("op");
+            match op {
                 Op::Timeout => {
                     if e.result() != -62 {
                         warn!("Timeout result not 62: {}", e.result());
@@ -262,29 +129,26 @@ fn main() -> Result<(), std::io::Error> {
 
                     // Create a new request object around this file descriptor and enqueue the
                     // first read
-                    let mut req = Request::new(types::Fd(e.result()), cache.clone(), write_timing_histogram.clone(), args.chunk_size);
-                    let re = unsafe { req.read() };
+                    let mut req = Request::new(
+                        types::Fd(e.result()),
+                        cache.clone(),
+                        write_timing_histogram.clone(),
+                        args.chunk_size,
+                    );
+                    let re = req.read();
                     to_submit.push(re);
                     reqs.insert(e.result(), req);
                 },
-                _ => {
-                    // Get the request out of our outstanding requests hashmap
-                    let req = match reqs.get_mut(&fd) {
-                        Some(r) => r,
-                        None => {
-                            warn!("No outstanding request for flags: {} result: {} ud: {}", e.flags(), e.result(), e.user_data());
-                            continue;
-                        },
-                    };
-
+                Op::Recv => {
+                    trace!("Recv CQE result={} flags={} user_data={}", e.result(), e.flags(), e.user_data());
                     if e.result() == -1 {
-                        error!("Request error: {}", req.fd.0);
-                        unsafe { libc::close(req.fd.0); };
+                        error!("Request error: {}", fd);
+                        unsafe { libc::close(fd); };
                         reqs.remove(&fd);
                         continue;
                     }
                     if e.result() == 0 {
-                        unsafe { libc::close(req.fd.0); };
+                        unsafe { libc::close(fd); };
                         reqs.remove(&fd);
                         continue;
                     }
@@ -298,26 +162,21 @@ fn main() -> Result<(), std::io::Error> {
                             104 => "connection reset by peer",
                             _ => "other",
                         };
-                        error!("Error on fd: {} {} {} {}", fd, e.result(), error, if req.responded { "responded" } else { "started" });
-                        unsafe { libc::close(req.fd.0); };
+                        error!("Error reading: {} {} {}", fd, e.result(), error);
+                        unsafe { libc::close(fd); };
                         reqs.remove(&fd);
                         continue;
                     }
 
-                    // The completion queue returned a successful write response
-                    if req.responded {
-                        trace!("Write event! flags: {} result: {} ud: {}", e.flags(), e.result(), e.user_data());
-                        req.advance_write(e.result().try_into().unwrap());
-                        // TODO: No keep alive implemented yet
-                        if req.done() {
-                            unsafe { libc::close(req.fd.0); };
-                            reqs.remove(&fd);
-                        } else {
-                            let send_e = unsafe { req.send() };
-                            to_submit.push(send_e);
-                        }
-                        continue;
-                    }
+                    // Get the request out of our outstanding requests hashmap
+                    let req = match reqs.get_mut(&fd) {
+                        Some(r) => r,
+                        None => {
+                            warn!("No outstanding request for flags: {} result: {} ud: {}", e.flags(), e.result(), e.user_data());
+                            continue;
+                        },
+                    };
+
                     trace!("Read event! flags: {} result: {} ud: {}", e.flags(), e.result(), e.user_data());
 
                     // Advance the request internal offset pointer by how many bytes were read
@@ -329,6 +188,57 @@ fn main() -> Result<(), std::io::Error> {
                     for e in entries {
                         to_submit.push(e);
                     }
+                },
+                Op::Send => {
+                    trace!("Send CQE result={} flags={} user_data={}", e.result(), e.flags(), e.user_data());
+                    if e.result() == -1 {
+                        error!("Request error: {}", fd);
+                        unsafe { libc::close(fd); };
+                        reqs.remove(&fd);
+                        continue;
+                    }
+                    if e.result() == 0 {
+                        unsafe { libc::close(fd); };
+                        reqs.remove(&fd);
+                        continue;
+                    }
+                    if e.result() < 0 {
+                        let error = match -e.result() {
+                            libc::EFAULT => "efault",
+                            libc::EPIPE => "epipe",
+                            libc::EIO => "eio",
+                            libc::EINVAL => "einval",
+                            libc::EBADF => "ebadf",
+                            104 => "connection reset by peer",
+                            _ => "other",
+                        };
+                        error!("Error writing: {} {} {}", fd, e.result(), error);
+                        unsafe { libc::close(fd); };
+                        reqs.remove(&fd);
+                        continue;
+                    }
+
+                    // Get the request out of our outstanding requests hashmap
+                    let req = match reqs.get_mut(&fd) {
+                        Some(r) => r,
+                        None => {
+                            warn!("No outstanding request for flags: {} result: {} ud: {}", e.flags(), e.result(), e.user_data());
+                            continue;
+                        },
+                    };
+
+                    trace!("Write event! flags: {} result: {} ud: {}", e.flags(), e.result(), e.user_data());
+                    // TODO: No keep alive implemented yet
+                    match req.send(e.result().try_into().unwrap()) {
+                        Some(entry) => to_submit.push(entry),
+                        None => {
+                            unsafe { libc::close(fd); };
+                            reqs.remove(&fd);
+                        }
+                    }
+                },
+                _ => {
+                    warn!("Unrecognized opcode cqe flags={} result={} user_data={}", e.flags(), e.result(), e.user_data());
                 },
             }
         }

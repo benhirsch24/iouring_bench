@@ -110,6 +110,7 @@ pub enum Op {
     Timeout = 0x0002,
     Recv = 0x0004,
     Send = 0x0008,
+    Other = 0xFFFF,
 }
 
 impl Op {
