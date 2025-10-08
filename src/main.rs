@@ -9,10 +9,11 @@ use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
 
+pub mod user_data;
+use user_data::{Op, UserData};
+
 static BUFFER_SIZE : usize = 1024*1024;
 
-const ACCEPT_CODE: u64 = opcode::Accept::CODE as u64;
-const TIMEOUT_CODE: u64 = opcode::Timeout::CODE as u64;
 const NOT_FOUND: &'static str = "HTTP/1.1 404 Not Found\r\nContent-Length: 8\r\n\r\nNotFound";
 const HEALTH_OK: &'static str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
 const SILLY_TEXT: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/silly_text.txt"));
@@ -49,7 +50,8 @@ impl Request {
     unsafe fn read(&mut self) -> Entry {
         let ptr = unsafe { self.buffer.as_mut_ptr().add(self.filled) };
         let read_e = opcode::Recv::new(self.fd, ptr, (BUFFER_SIZE - self.filled) as u32);
-        return read_e.build().user_data(self.fd.0 as u64).into();
+        let ud = UserData::new(Op::Recv, self.fd.0);
+        return read_e.build().user_data(ud.into_u64()).into();
     }
 
     fn advance_read(&mut self, n: usize) {
@@ -78,6 +80,7 @@ impl Request {
         let ptr = self.response.as_ref().unwrap().slice(start..end).as_ptr();
         let to_send : u32 = (end - start) as u32;
         let send_e = opcode::Send::new(self.fd, ptr, to_send);
+        let ud = UserData::new(Op::Send, self.fd.0);
 
         // Stats on time between writes
         if let Some(n) = self.last_write {
@@ -85,7 +88,7 @@ impl Request {
         }
         self.last_write = Some(std::time::Instant::now());
 
-        return send_e.build().user_data(self.fd.0 as u64).into();
+        return send_e.build().user_data(ud.into_u64()).into();
     }
 
     fn serve(&mut self) -> Vec<Entry> {
@@ -200,17 +203,19 @@ fn main() -> Result<(), std::io::Error> {
     let mut last_submit = std::time::Instant::now();
 
     // Arm multi-shot accept so we don't have to continually resubmit
-    let accept_e = opcode::AcceptMulti::new(lfd).build().user_data(ACCEPT_CODE);
+    let accept_ud = UserData::new(Op::Accept, 0);
+    let accept_e = opcode::AcceptMulti::new(lfd).build().user_data(accept_ud.into_u64());
     unsafe { uring.submission().push(&accept_e).expect("push accept") };
     // Add the first timeout
+    let timeout_ud = UserData::new(Op::Timeout, 0);
     let timeout = opcode::Timeout::new(&ts as *const types::Timespec)
         .flags(io_uring::types::TimeoutFlags::MULTISHOT)
         .count(0)
         .build()
-        .user_data(TIMEOUT_CODE);
+        .user_data(timeout_ud.into_u64());
     unsafe { uring.submission().push(&timeout).expect("timeout") };
     uring.submit().expect("First submit");
-    debug!("Multishot accept armed");
+    debug!("Multishot accept armed ud={}", accept_ud.into_u64());
 
     loop {
         let mut completed = 0;
@@ -220,8 +225,11 @@ fn main() -> Result<(), std::io::Error> {
         for e in uring.completion() {
             completions_last_period += 1;
             completed += 1;
-            match e.user_data() {
-                TIMEOUT_CODE => {
+            trace!("completion result={} ud={}", e.result(), e.user_data());
+            let ud = UserData::try_from(e.user_data()).expect("failed userdata extract");
+            let fd = ud.fd();
+            match ud.op().expect("op") {
+                Op::Timeout => {
                     if e.result() != -62 {
                         warn!("Timeout result not 62: {}", e.result());
                     }
@@ -245,7 +253,7 @@ fn main() -> Result<(), std::io::Error> {
                     completions_last_period = 0;
                     submit_and_wait = 0;
                 },
-                ACCEPT_CODE => {
+                Op::Accept => {
                     if e.result() == 127 {
                         error!("Failed to accept");
                         continue;
@@ -261,7 +269,6 @@ fn main() -> Result<(), std::io::Error> {
                 },
                 _ => {
                     // Get the request out of our outstanding requests hashmap
-                    let fd = e.user_data() as i32;
                     let req = match reqs.get_mut(&fd) {
                         Some(r) => r,
                         None => {
