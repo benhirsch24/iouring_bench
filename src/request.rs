@@ -1,8 +1,6 @@
 use bytes::{Bytes, BytesMut};
-use histogram::Histogram;
 use io_uring::{opcode, squeue::Entry, types};
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -13,44 +11,36 @@ static BUFFER_SIZE : usize = 1024*1024;
 const NOT_FOUND: &'static str = "HTTP/1.1 404 Not Found\r\nContent-Length: 8\r\n\r\nNotFound";
 const HEALTH_OK: &'static str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
 
-pub struct Request {
+pub trait Request {
+    fn read(&mut self) -> Entry;
+    fn advance_read(&mut self, n: usize);
+    fn send(&mut self, n: usize) -> Option<Entry>;
+    fn serve(&mut self) -> Vec<Entry>;
+}
+
+pub struct CachingRequest {
     fd: types::Fd,
     buffer: BytesMut,
     response: Option<Bytes>,
     cache: Rc<HashMap<String, String>>,
     sent: usize,
     chunk_size: usize,
-    write_timing_histogram: Rc<RefCell<Histogram>>,
+    //write_timing_histogram: Rc<RefCell<Histogram>>,
     last_write: Option<std::time::Instant>,
 }
 
-impl Request {
-    pub fn new(fd: types::Fd, cache: Rc<HashMap<String, String>>, write_timing_histogram: Rc<RefCell<Histogram>>, chunk_size: usize) -> Request {
-        Request {
+impl CachingRequest {
+    pub fn new(fd: types::Fd, cache: Rc<HashMap<String, String>>, /*write_timing_histogram: Rc<RefCell<Histogram>>,*/ chunk_size: usize) -> CachingRequest {
+        CachingRequest {
             fd,
             buffer: BytesMut::with_capacity(BUFFER_SIZE),
             response: None,
             cache,
             sent: 0,
             chunk_size,
-            write_timing_histogram,
+            //write_timing_histogram,
             last_write: None,
         }
-    }
-
-    pub fn read(&mut self) -> Entry {
-        let ptr = unsafe { self.buffer.as_mut_ptr().add(self.buffer.len()) };
-        let read_e = opcode::Recv::new(self.fd, ptr, (self.buffer.capacity() - self.buffer.len()) as u32);
-        let ud = UserData::new(Op::Recv, self.fd.0);
-        return read_e.build().user_data(ud.into_u64()).into();
-    }
-
-    pub fn advance_read(&mut self, n: usize) {
-        unsafe { self.buffer.set_len(self.buffer.len() + n) };
-    }
-
-    pub fn advance_write(&mut self, n: usize) {
-        self.sent += n;
     }
 
     pub fn is_complete(&self) -> bool {
@@ -63,7 +53,21 @@ impl Request {
         self.response = Some(Bytes::copy_from_slice(resp.as_bytes()));
     }
 
-    pub fn send(&mut self, n: usize) -> Option<Entry> {
+}
+
+impl Request for CachingRequest {
+    fn read(&mut self) -> Entry {
+        let ptr = unsafe { self.buffer.as_mut_ptr().add(self.buffer.len()) };
+        let read_e = opcode::Recv::new(self.fd, ptr, (self.buffer.capacity() - self.buffer.len()) as u32);
+        let ud = UserData::new(Op::Recv, self.fd.0);
+        return read_e.build().user_data(ud.into_u64()).into();
+    }
+
+    fn advance_read(&mut self, n: usize) {
+        unsafe { self.buffer.set_len(self.buffer.len() + n) };
+    }
+
+    fn send(&mut self, n: usize) -> Option<Entry> {
         self.sent += n;
         let len = self.response.as_ref().unwrap().len();
         if self.sent == len {
@@ -78,15 +82,15 @@ impl Request {
         let ud = UserData::new(Op::Send, self.fd.0);
 
         // Stats on time between writes
-        if let Some(n) = self.last_write {
-            self.write_timing_histogram.borrow_mut().increment(n.elapsed().as_micros() as u64).expect("increment");
-        }
+        //if let Some(n) = self.last_write {
+        //    self.write_timing_histogram.borrow_mut().increment(n.elapsed().as_micros() as u64).expect("increment");
+        //}
         self.last_write = Some(std::time::Instant::now());
 
         Some(send_e.build().user_data(ud.into_u64()).into())
     }
 
-    pub fn serve(&mut self) -> Vec<Entry> {
+    fn serve(&mut self) -> Vec<Entry> {
         let mut headers = [httparse::EMPTY_HEADER; 16];
         let mut r = httparse::Request::new(headers.as_mut_slice());
         let request = r.parse(&self.buffer[..]).expect("parse error");

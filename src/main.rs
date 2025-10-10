@@ -1,9 +1,7 @@
 use clap::{Parser};
-use io_uring::{IoUring, opcode, types};
-use histogram::Histogram;
-use log::{debug, error, info, trace, warn};
+use io_uring::{opcode, types};
+use log::{error, info};
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
@@ -13,6 +11,8 @@ use user_data::{Op, UserData};
 
 pub mod request;
 use request::*;
+
+pub mod uring;
 
 const SILLY_TEXT: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/silly_text.txt"));
 
@@ -40,233 +40,36 @@ fn main() -> Result<(), std::io::Error> {
     env_logger::init();
     let args = Args::parse();
     info!("{args:?}");
-    let mut uring: IoUring<io_uring::squeue::Entry, io_uring::cqueue::Entry> = if args.sqpoll_interval_ms > 0 {
-        IoUring::builder()
-            .setup_cqsize(args.uring_size*2)
-            .setup_sqpoll(args.sqpoll_interval_ms)
-            .build(args.uring_size).expect("uring")
-    } else {
-        IoUring::builder()
-            .setup_cqsize(args.uring_size*2)
-            .build(args.uring_size).expect("uring")
-    };
 
     // Here's our super simple statically allocated cache
     let mut cache = Rc::new(HashMap::<String, String>::new());
     Rc::get_mut(&mut cache).unwrap().insert("1".to_string(), SILLY_TEXT.to_string());
-    let write_timing_histogram = Rc::new(RefCell::new(Histogram::new(7, 64).expect("histogram")));
-    let mut submit_and_wait_batch_size = Histogram::new(7, 64).expect("sawbs histo");
 
-    let listener = std::net::TcpListener::bind("0.0.0.0:8080").expect("tcp listener");
-    let listener_fd = listener.as_raw_fd();
-    let lfd = types::Fd(listener_fd);
-    let mut reqs = HashMap::new();
-    let mut to_submit = vec![];
-    let mut submitted_last_period = 0;
-    let mut completions_last_period = 0;
-    let mut submit_and_wait = 0;
-    let ts = types::Timespec::new().sec(5).nsec(0);
-    let mut last_submit = std::time::Instant::now();
+    uring::init(uring::UringArgs{
+        uring_size: args.uring_size,
+        submissions_threshold: args.submissions_threshold,
+        sqpoll_interval_ms: args.sqpoll_interval_ms,
+    })?;
 
     // Arm multi-shot accept so we don't have to continually resubmit
+    let listener = std::net::TcpListener::bind("0.0.0.0:8080").expect("tcp listener");
+    let lfd = types::Fd(listener.as_raw_fd());
     let accept_ud = UserData::new(Op::Accept, 0);
     let accept_e = opcode::AcceptMulti::new(lfd).build().user_data(accept_ud.into_u64());
-    unsafe { uring.submission().push(&accept_e).expect("push accept") };
+    uring::submit(accept_e).expect("arm accept");
+
     // Add the first timeout
     let timeout_ud = UserData::new(Op::Timeout, 0);
+    let ts = types::Timespec::new().sec(5).nsec(0);
     let timeout = opcode::Timeout::new(&ts as *const types::Timespec)
         .flags(io_uring::types::TimeoutFlags::MULTISHOT)
         .count(0)
         .build()
         .user_data(timeout_ud.into_u64());
-    unsafe { uring.submission().push(&timeout).expect("timeout") };
-    uring.submit().expect("First submit");
-    debug!("Multishot accept armed ud={}", accept_ud.into_u64());
+    uring::submit(timeout).expect("arm timeout");
 
-    loop {
-        let mut completed = 0;
-
-        // Check for completions
-        uring.completion().sync();
-        for e in uring.completion() {
-            completions_last_period += 1;
-            completed += 1;
-            trace!("completion result={} ud={}", e.result(), e.user_data());
-            let ud = UserData::try_from(e.user_data()).expect("failed userdata extract");
-            let fd = ud.fd();
-            let op = ud.op().expect("op");
-            match op {
-                Op::Timeout => {
-                    if e.result() != -62 {
-                        warn!("Timeout result not 62: {}", e.result());
-                    }
-
-                    info!("Metrics: submitted_last_period={submitted_last_period} completions_last_period={completions_last_period} submit_and_wait={submit_and_wait} backlog={}", to_submit.len());
-
-                    info!("submit_and_wait batch sizes");
-                    let percentiles = [0.0, 50.0, 90.0, 99.0, 99.9, 99.99, 100.0];
-                    if let Some(ps) = submit_and_wait_batch_size.percentiles(&percentiles).expect("saw percentiles") {
-                        for p in ps {
-                            info!("p{} range={:?} count={}", p.0, p.1.range(), p.1.count());
-                        }
-                    }
-
-                    let percentiles = [0.0, 50.0, 90.0, 99.0, 100.0];
-                    if let Some(ps) = write_timing_histogram.borrow().percentiles(&percentiles).expect("percentiles") {
-                        debug!("Median time betwen writes for a request={}", ps[1].1.count());
-                    }
-
-                    submitted_last_period = 0;
-                    completions_last_period = 0;
-                    submit_and_wait = 0;
-                },
-                Op::Accept => {
-                    if e.result() == 127 {
-                        error!("Failed to accept");
-                        continue;
-                    }
-                    trace!("Accept! flags: {} result: {} ud: {}", e.flags(), e.result(), e.user_data());
-
-                    // Create a new request object around this file descriptor and enqueue the
-                    // first read
-                    let mut req = Request::new(
-                        types::Fd(e.result()),
-                        cache.clone(),
-                        write_timing_histogram.clone(),
-                        args.chunk_size,
-                    );
-                    let re = req.read();
-                    to_submit.push(re);
-                    reqs.insert(e.result(), req);
-                },
-                Op::Recv => {
-                    trace!("Recv CQE result={} flags={} user_data={}", e.result(), e.flags(), e.user_data());
-                    if e.result() == -1 {
-                        error!("Request error: {}", fd);
-                        unsafe { libc::close(fd); };
-                        reqs.remove(&fd);
-                        continue;
-                    }
-                    if e.result() == 0 {
-                        unsafe { libc::close(fd); };
-                        reqs.remove(&fd);
-                        continue;
-                    }
-                    if e.result() < 0 {
-                        let error = match -e.result() {
-                            libc::EFAULT => "efault",
-                            libc::EPIPE => "epipe",
-                            libc::EIO => "eio",
-                            libc::EINVAL => "einval",
-                            libc::EBADF => "ebadf",
-                            104 => "connection reset by peer",
-                            _ => "other",
-                        };
-                        error!("Error reading: {} {} {}", fd, e.result(), error);
-                        unsafe { libc::close(fd); };
-                        reqs.remove(&fd);
-                        continue;
-                    }
-
-                    // Get the request out of our outstanding requests hashmap
-                    let req = match reqs.get_mut(&fd) {
-                        Some(r) => r,
-                        None => {
-                            warn!("No outstanding request for flags: {} result: {} ud: {}", e.flags(), e.result(), e.user_data());
-                            continue;
-                        },
-                    };
-
-                    trace!("Read event! flags: {} result: {} ud: {}", e.flags(), e.result(), e.user_data());
-
-                    // Advance the request internal offset pointer by how many bytes were read
-                    // (the result value of the read call)
-                    req.advance_read(e.result() as usize);
-
-                    // Parse the request and submit any calls to the submission queue
-                    let entries = req.serve();
-                    for e in entries {
-                        to_submit.push(e);
-                    }
-                },
-                Op::Send => {
-                    trace!("Send CQE result={} flags={} user_data={}", e.result(), e.flags(), e.user_data());
-                    if e.result() == -1 {
-                        error!("Request error: {}", fd);
-                        unsafe { libc::close(fd); };
-                        reqs.remove(&fd);
-                        continue;
-                    }
-                    if e.result() == 0 {
-                        unsafe { libc::close(fd); };
-                        reqs.remove(&fd);
-                        continue;
-                    }
-                    if e.result() < 0 {
-                        let error = match -e.result() {
-                            libc::EFAULT => "efault",
-                            libc::EPIPE => "epipe",
-                            libc::EIO => "eio",
-                            libc::EINVAL => "einval",
-                            libc::EBADF => "ebadf",
-                            104 => "connection reset by peer",
-                            _ => "other",
-                        };
-                        error!("Error writing: {} {} {}", fd, e.result(), error);
-                        unsafe { libc::close(fd); };
-                        reqs.remove(&fd);
-                        continue;
-                    }
-
-                    // Get the request out of our outstanding requests hashmap
-                    let req = match reqs.get_mut(&fd) {
-                        Some(r) => r,
-                        None => {
-                            warn!("No outstanding request for flags: {} result: {} ud: {}", e.flags(), e.result(), e.user_data());
-                            continue;
-                        },
-                    };
-
-                    trace!("Write event! flags: {} result: {} ud: {}", e.flags(), e.result(), e.user_data());
-                    // TODO: No keep alive implemented yet
-                    match req.send(e.result().try_into().unwrap()) {
-                        Some(entry) => to_submit.push(entry),
-                        None => {
-                            unsafe { libc::close(fd); };
-                            reqs.remove(&fd);
-                        }
-                    }
-                },
-                _ => {
-                    warn!("Unrecognized opcode cqe flags={} result={} user_data={}", e.flags(), e.result(), e.user_data());
-                },
-            }
-        }
-
-        // Submit N batches of size threshold
-        let num_batches = to_submit.len() / args.submissions_threshold;
-        for _ in 0..num_batches {
-            let batch: Vec<io_uring::squeue::Entry> = to_submit.drain(0..args.submissions_threshold).collect();
-            unsafe { uring.submission().push_multiple(&batch) }.expect("push multiple");
-            uring.submit().expect("Submitted");
-            last_submit = std::time::Instant::now();
-            submitted_last_period += 1;
-        }
-
-        // Submit and wait for a completion when:
-        // 1. We're in SQPOLL mode and we haven't submitted in over the interval, so the kernel
-        //    thread may have returned.
-        // 2. We haven't submitted in some period of time because we haven't hit the batch threshold
-        let should_sqpoll_submit = args.sqpoll_interval_ms > 0 && last_submit.elapsed().as_millis() > args.sqpoll_interval_ms.into();
-        if should_sqpoll_submit || completed == 0 {
-            let batch: Vec<io_uring::squeue::Entry> = to_submit.drain(..).collect();
-            unsafe { uring.submission().push_multiple(&batch) }.expect("push multiple");
-            debug!("Submit and wait last_submit={} backlog={} batch_size={} t_diff={}", last_submit.elapsed().as_millis(), to_submit.len(), batch.len(), last_submit.elapsed().as_micros());
-            submit_and_wait_batch_size.increment(batch.len() as u64).unwrap();
-            submit_and_wait += 1;
-            last_submit = std::time::Instant::now();
-            uring.submit_and_wait(1)?;
-        }
+    if let Err(e) = uring::run(move |fd| CachingRequest::new(fd, cache.clone(), args.chunk_size) ) {
+        error!("Error running uring: {}", e);
     }
     Ok(())
 }
