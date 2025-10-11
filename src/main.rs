@@ -68,7 +68,13 @@ fn main() -> Result<(), std::io::Error> {
         .user_data(timeout_ud.into_u64());
     uring::submit(timeout).expect("arm timeout");
 
-    if let Err(e) = uring::run(move |fd| CachingRequest::new(fd, cache.clone(), args.chunk_size) ) {
+    if let Err(e) = uring::run(move |fd| {
+        let mut req = CachingRequest::new(fd, cache.clone(), args.chunk_size);
+        // Arm the first read
+        // TODO: multishot recv
+        uring::submit(req.read())?;
+        Ok(req)
+    }) {
         error!("Error running uring: {}", e);
     }
     Ok(())

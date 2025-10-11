@@ -1,21 +1,25 @@
 use bytes::{Bytes, BytesMut};
 use io_uring::{opcode, squeue::Entry, types};
+use log::{warn};
 
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::user_data::{Op, UserData};
+use crate::uring::submit;
 
 static BUFFER_SIZE : usize = 1024*1024;
 
 const NOT_FOUND: &'static str = "HTTP/1.1 404 Not Found\r\nContent-Length: 8\r\n\r\nNotFound";
 const HEALTH_OK: &'static str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
 
+pub enum RequestState {
+    Continue,
+    Done,
+}
+
 pub trait Request {
-    fn read(&mut self) -> Entry;
-    fn advance_read(&mut self, n: usize);
-    fn send(&mut self, n: usize) -> Option<Entry>;
-    fn serve(&mut self) -> Vec<Entry>;
+    fn handle(&mut self, op: Op, res: i32) -> Result<RequestState, std::io::Error>;
 }
 
 pub struct CachingRequest {
@@ -53,10 +57,7 @@ impl CachingRequest {
         self.response = Some(Bytes::copy_from_slice(resp.as_bytes()));
     }
 
-}
-
-impl Request for CachingRequest {
-    fn read(&mut self) -> Entry {
+    pub fn read(&mut self) -> Entry {
         let ptr = unsafe { self.buffer.as_mut_ptr().add(self.buffer.len()) };
         let read_e = opcode::Recv::new(self.fd, ptr, (self.buffer.capacity() - self.buffer.len()) as u32);
         let ud = UserData::new(Op::Recv, self.fd.0);
@@ -145,5 +146,34 @@ impl Request for CachingRequest {
         }
 
         sqe
+    }
+}
+
+impl Request for CachingRequest {
+    fn handle(&mut self, op: Op, result: i32) -> Result<RequestState, std::io::Error> {
+        match op {
+            Op::Recv => {
+                // Advance the request internal offset pointer by how many bytes were read
+                // (the result value of the read call)
+                self.advance_read(result as usize);
+
+                // Parse the request and submit any calls to the submission queue
+                let entries = self.serve();
+                for e in entries {
+                    submit(e).expect("push serve");
+                }
+            },
+            Op::Send => {
+                // TODO: No keep alive implemented yet
+                match self.send(result.try_into().unwrap()) {
+                    Some(entry) => submit(entry).expect("push write"),
+                    None => {
+                        return Ok(RequestState::Done);
+                    }
+                }
+            },
+            _ => warn!("Didn't expect op {:?}", op)
+        }
+        Ok(RequestState::Continue)
     }
 }

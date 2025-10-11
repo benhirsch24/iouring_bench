@@ -2,12 +2,12 @@ use io_uring::{IoUring, squeue::Entry, types};
 use histogram::Histogram;
 use log::{debug, error, info, trace, warn};
 
-use std::cell::RefCell;
+use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::os::fd::RawFd;
 use std::rc::Rc;
 
-use crate::request::Request;
+use crate::request::{Request, RequestState};
 use crate::user_data::{Op, UserData};
 
 pub struct UringArgs {
@@ -23,33 +23,39 @@ pub struct Uring {
     to_submit: Vec<Entry>,
 }
 
+// Unsafe cell is used because we are using thread-local storage and there will be only one uring
+// active per thread.
+// This allows us to call uring::run(...); and then from within the run function or the passed-in
+// request factory function call uring::submit(...);
 thread_local! {
-    static URING: RefCell<Option<Uring>> = RefCell::new(None);
+    static URING: UnsafeCell<Option<Uring>> = UnsafeCell::new(None);
 }
 
 pub fn init(args: UringArgs) -> Result<(), std::io::Error> {
     URING.with(|uring| {
-        let mut uring_ref = uring.borrow_mut();
-        if uring_ref.is_some() {
-            return Ok(());
-        }
+        unsafe {
+            let uring_ref = &mut *uring.get();
+            if uring_ref.is_some() {
+                return Ok(());
+            }
 
-        let new_uring = Uring::new(args)?;
-        *uring_ref = Some(new_uring);
-        Ok(())
+            let new_uring = Uring::new(args)?;
+            *uring_ref = Some(new_uring);
+            Ok(())
+        }
     })
 }
 
 pub fn run<F, R>(request_factory: F) -> Result<(), std::io::Error>
     where
-        F: Fn(types::Fd) -> R,
+        F: Fn(types::Fd) -> Result<R, std::io::Error>,
         R: Request + 'static
 {
     URING.with(|uring| {
-        let mut uring_ref = uring.borrow_mut();
-        match uring_ref.as_mut() {
-            Some(uring) => uring.run(request_factory),
-            None => panic!("uring not initialized")
+        unsafe {
+            let uring_ref = &mut *uring.get();
+            let uring_mut = uring_ref.as_mut().unwrap();
+            uring_mut.run(request_factory)
         }
     })?;
     Ok(())
@@ -57,10 +63,10 @@ pub fn run<F, R>(request_factory: F) -> Result<(), std::io::Error>
 
 pub fn submit(sqe: Entry) -> Result<(), std::io::Error> {
     URING.with(|uring| {
-        let mut uring_ref = uring.borrow_mut();
-        match uring_ref.as_mut() {
-            Some(uring) => uring.submit(sqe),
-            None => panic!("uring not initialized")
+        unsafe {
+            let uring_ref = &mut *uring.get();
+            let uring_mut = uring_ref.as_mut().unwrap();
+            uring_mut.submit(sqe)
         }
     });
     Ok(())
@@ -88,7 +94,7 @@ impl Uring {
 
     fn run<F, R>(&mut self, request_factory: F) -> Result<(), std::io::Error>
     where
-        F: Fn(types::Fd) -> R,
+        F: Fn(types::Fd) -> Result<R, std::io::Error>,
         R: Request + 'static
     {
         let mut submitted_last_period = 0;
@@ -144,9 +150,13 @@ impl Uring {
 
                         // Create a new request object around this file descriptor and enqueue the
                         // first read
-                        let mut req = Box::new(request_factory(types::Fd(e.result())));
-                        let re = req.read();
-                        self.to_submit.push(re);
+                        let req = match request_factory(types::Fd(e.result())) {
+                            Ok(r) => Box::new(r),
+                            Err(e) => {
+                                error!("Failed to create request: {}", e);
+                                continue;
+                            }
+                        };
                         self.requests.insert(e.result(), req);
                     },
                     Op::Recv => {
@@ -187,17 +197,17 @@ impl Uring {
                             },
                         };
 
-                        trace!("Read event! flags: {} result: {} ud: {}", e.flags(), e.result(), e.user_data());
-
-                        // Advance the request internal offset pointer by how many bytes were read
-                        // (the result value of the read call)
-                        req.advance_read(e.result() as usize);
-
-                        // Parse the request and submit any calls to the submission queue
-                        let entries = req.serve();
-                        for e in entries {
-                            self.to_submit.push(e);
-                        }
+                        match req.handle(op, e.result()) {
+                            Ok(RequestState::Done) => {
+                                unsafe { libc::close(fd); };
+                                self.requests.remove(&fd);
+                            },
+                            Ok(_) => trace!("handled"),
+                            Err(e) => {
+                                error!("Error when handling: {}", e);
+                                continue;
+                            }
+                        };
                     },
                     Op::Send => {
                         trace!("Send CQE result={} flags={} user_data={}", e.result(), e.flags(), e.user_data());
@@ -237,15 +247,17 @@ impl Uring {
                             },
                         };
 
-                        trace!("Write event! flags: {} result: {} ud: {}", e.flags(), e.result(), e.user_data());
-                        // TODO: No keep alive implemented yet
-                        match req.send(e.result().try_into().unwrap()) {
-                            Some(entry) => self.to_submit.push(entry),
-                            None => {
+                        match req.handle(op, e.result()) {
+                            Ok(RequestState::Done) => {
                                 unsafe { libc::close(fd); };
                                 self.requests.remove(&fd);
+                            },
+                            Ok(_) => trace!("handled"),
+                            Err(e) => {
+                                error!("Error when handling: {}", e);
+                                continue;
                             }
-                        }
+                        };
                     },
                     _ => {
                         warn!("Unrecognized opcode cqe flags={} result={} user_data={}", e.flags(), e.result(), e.user_data());
