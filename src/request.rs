@@ -15,16 +15,12 @@ static BUFFER_SIZE : usize = 1024*1024;
 const NOT_FOUND: &'static str = "HTTP/1.1 404 Not Found\r\nContent-Length: 8\r\n\r\nNotFound";
 const HEALTH_OK: &'static str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
 
-pub enum RequestState {
+pub enum ConnectionState {
     Continue,
     Done,
 }
 
-pub trait Request {
-    fn handle(&mut self, op: Op, res: i32) -> Result<RequestState, std::io::Error>;
-}
-
-pub struct CachingRequest {
+pub struct Connection {
     fd: types::Fd,
     buffer: BytesMut,
     response: Option<Bytes>,
@@ -35,9 +31,9 @@ pub struct CachingRequest {
     last_write: Option<std::time::Instant>,
 }
 
-impl CachingRequest {
-    pub fn new(fd: types::Fd, cache: Rc<HashMap<String, String>>, write_timing_histogram: Rc<RefCell<Histogram>>, chunk_size: usize) -> CachingRequest {
-        CachingRequest {
+impl Connection {
+    pub fn new(fd: types::Fd, cache: Rc<HashMap<String, String>>, write_timing_histogram: Rc<RefCell<Histogram>>, chunk_size: usize) -> Connection {
+        Connection {
             fd,
             buffer: BytesMut::with_capacity(BUFFER_SIZE),
             response: None,
@@ -54,7 +50,7 @@ impl CachingRequest {
     }
 
     pub fn set_response(&mut self, resp: &str) {
-        // Store response in this request as it needs to be allocated until the kernel has sent it
+        // Store response in this connection as it needs to be allocated until the kernel has sent it
         // Eventually this could be a pointer to kernel owned buffer
         self.response = Some(Bytes::copy_from_slice(resp.as_bytes()));
     }
@@ -150,17 +146,15 @@ impl CachingRequest {
 
         sqe
     }
-}
 
-impl Request for CachingRequest {
-    fn handle(&mut self, op: Op, result: i32) -> Result<RequestState, std::io::Error> {
+    pub fn handle(&mut self, op: Op, result: i32) -> Result<ConnectionState, std::io::Error> {
         match op {
             Op::Recv => {
-                // Advance the request internal offset pointer by how many bytes were read
+                // Advance the connection internal offset pointer by how many bytes were read
                 // (the result value of the read call)
                 self.advance_read(result as usize);
 
-                // Parse the request and submit any calls to the submission queue
+                // Parse the data and submit any calls to the submission queue
                 let entries = self.serve();
                 for e in entries {
                     submit(e).expect("push serve");
@@ -171,12 +165,12 @@ impl Request for CachingRequest {
                 match self.send(result.try_into().unwrap()) {
                     Some(entry) => submit(entry).expect("push write"),
                     None => {
-                        return Ok(RequestState::Done);
+                        return Ok(ConnectionState::Done);
                     }
                 }
             },
             _ => warn!("Didn't expect op {:?}", op)
         }
-        Ok(RequestState::Continue)
+        Ok(ConnectionState::Continue)
     }
 }

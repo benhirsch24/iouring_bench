@@ -70,7 +70,7 @@ fn main() -> Result<(), std::io::Error> {
         .user_data(timeout_ud.into_u64());
     uring::submit(timeout).expect("arm timeout");
 
-    let mut requests = HashMap::new();
+    let mut connections = HashMap::new();
     let write_timing_histogram = Rc::new(RefCell::new(Histogram::new(7, 64).expect("histogram")));
     if let Err(e) = uring::run(move |ud, res, flags| {
         let fd = ud.fd();
@@ -107,21 +107,21 @@ fn main() -> Result<(), std::io::Error> {
                 // Create a new request object around this file descriptor and enqueue the
                 // first read
                 // TODO: multishot recv
-                let mut req = CachingRequest::new(types::Fd(res), cache.clone(), write_timing_histogram.clone(), args.chunk_size);
+                let mut req = Connection::new(types::Fd(res), cache.clone(), write_timing_histogram.clone(), args.chunk_size);
                 uring::submit(req.read()).expect("read submit");
-                requests.insert(res, req);
+                connections.insert(res, req);
             },
             Op::Recv => {
                 trace!("Recv CQE result={} flags={} user_data={}", res, flags, ud);
                 if res == -1 {
                     error!("Request error: {}", fd);
                     unsafe { libc::close(fd); };
-                    requests.remove(&fd);
+                    connections.remove(&fd);
                     return Ok(());
                 }
                 if res == 0 {
                     unsafe { libc::close(fd); };
-                    requests.remove(&fd);
+                    connections.remove(&fd);
                     return Ok(());
                 }
                 if res < 0 {
@@ -136,12 +136,12 @@ fn main() -> Result<(), std::io::Error> {
                     };
                     error!("Error reading: {} {} {}", fd, res, error);
                     unsafe { libc::close(fd); };
-                    requests.remove(&fd);
+                    connections.remove(&fd);
                     return Ok(());
                 }
 
-                // Get the request out of our outstanding requests hashmap
-                let req = match requests.get_mut(&fd) {
+                // Get the request out of our outstanding connections hashmap
+                let req = match connections.get_mut(&fd) {
                     Some(r) => r,
                     None => {
                         warn!("No outstanding request for flags: {} result: {} ud: {}", flags, res, ud);
@@ -150,9 +150,9 @@ fn main() -> Result<(), std::io::Error> {
                 };
 
                 match req.handle(op, res) {
-                    Ok(RequestState::Done) => {
+                    Ok(ConnectionState::Done) => {
                         unsafe { libc::close(fd); };
-                        requests.remove(&fd);
+                        connections.remove(&fd);
                     },
                     Ok(_) => trace!("handled"),
                     Err(e) => {
@@ -166,12 +166,12 @@ fn main() -> Result<(), std::io::Error> {
                 if res == -1 {
                     error!("Request error: {}", fd);
                     unsafe { libc::close(fd); };
-                    requests.remove(&fd);
+                    connections.remove(&fd);
                     return Ok(());
                 }
                 if res == 0 {
                     unsafe { libc::close(fd); };
-                    requests.remove(&fd);
+                    connections.remove(&fd);
                     return Ok(());
                 }
                 if res < 0 {
@@ -186,12 +186,12 @@ fn main() -> Result<(), std::io::Error> {
                     };
                     error!("Error writing: {} {} {}", fd, res, error);
                     unsafe { libc::close(fd); };
-                    requests.remove(&fd);
+                    connections.remove(&fd);
                     return Ok(());
                 }
 
-                // Get the request out of our outstanding requests hashmap
-                let req = match requests.get_mut(&fd) {
+                // Get the request out of our outstanding connections hashmap
+                let req = match connections.get_mut(&fd) {
                     Some(r) => r,
                     None => {
                         warn!("No outstanding request for flags: {} result: {} ud: {}", flags, res, ud);
@@ -200,9 +200,9 @@ fn main() -> Result<(), std::io::Error> {
                 };
 
                 match req.handle(op, res) {
-                    Ok(RequestState::Done) => {
+                    Ok(ConnectionState::Done) => {
                         unsafe { libc::close(fd); };
-                        requests.remove(&fd);
+                        connections.remove(&fd);
                     },
                     Ok(_) => trace!("handled"),
                     Err(e) => {
