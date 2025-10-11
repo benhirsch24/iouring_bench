@@ -1,8 +1,10 @@
 use bytes::{Bytes, BytesMut};
+use histogram::Histogram;
 use io_uring::{opcode, squeue::Entry, types};
-use log::{warn};
+use log::{trace, warn};
 
 use std::collections::HashMap;
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::user_data::{Op, UserData};
@@ -29,12 +31,12 @@ pub struct CachingRequest {
     cache: Rc<HashMap<String, String>>,
     sent: usize,
     chunk_size: usize,
-    //write_timing_histogram: Rc<RefCell<Histogram>>,
+    write_timing_histogram: Rc<RefCell<Histogram>>,
     last_write: Option<std::time::Instant>,
 }
 
 impl CachingRequest {
-    pub fn new(fd: types::Fd, cache: Rc<HashMap<String, String>>, /*write_timing_histogram: Rc<RefCell<Histogram>>,*/ chunk_size: usize) -> CachingRequest {
+    pub fn new(fd: types::Fd, cache: Rc<HashMap<String, String>>, write_timing_histogram: Rc<RefCell<Histogram>>, chunk_size: usize) -> CachingRequest {
         CachingRequest {
             fd,
             buffer: BytesMut::with_capacity(BUFFER_SIZE),
@@ -42,7 +44,7 @@ impl CachingRequest {
             cache,
             sent: 0,
             chunk_size,
-            //write_timing_histogram,
+            write_timing_histogram,
             last_write: None,
         }
     }
@@ -61,6 +63,7 @@ impl CachingRequest {
         let ptr = unsafe { self.buffer.as_mut_ptr().add(self.buffer.len()) };
         let read_e = opcode::Recv::new(self.fd, ptr, (self.buffer.capacity() - self.buffer.len()) as u32);
         let ud = UserData::new(Op::Recv, self.fd.0);
+        trace!("read: {} {:?}", ud, self.fd);
         return read_e.build().user_data(ud.into_u64()).into();
     }
 
@@ -83,9 +86,9 @@ impl CachingRequest {
         let ud = UserData::new(Op::Send, self.fd.0);
 
         // Stats on time between writes
-        //if let Some(n) = self.last_write {
-        //    self.write_timing_histogram.borrow_mut().increment(n.elapsed().as_micros() as u64).expect("increment");
-        //}
+        if let Some(n) = self.last_write {
+            self.write_timing_histogram.borrow_mut().increment(n.elapsed().as_micros() as u64).expect("increment");
+        }
         self.last_write = Some(std::time::Instant::now());
 
         Some(send_e.build().user_data(ud.into_u64()).into())

@@ -13,6 +13,20 @@ const LOW_MASK:  u64 = 0xFFFF_FFFF;
 #[derive(Copy, Clone, Eq, PartialEq, Hash)]
 pub struct UserData(u64);
 
+impl std::fmt::Display for UserData {
+    // This trait requires `fmt` with this exact signature.
+    fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
+        // Write strictly the first element into the supplied output
+        // stream: `f`. Returns `fmt::Result` which indicates whether the
+        // operation succeeded or failed. Note that `write!` uses syntax which
+        // is very similar to `println!`.
+        let op = self.op().expect("op unwrap in Display");
+        let fd = self.fd();
+        write!(f, "op={} fd={}", op, fd)
+    }
+}
+
+
 impl UserData {
     #[inline]
     pub fn new (op: Op, fd: RawFd) -> Self {
@@ -111,6 +125,19 @@ pub enum Op {
     Recv = 0x0004,
     Send = 0x0008,
     Other = 0xFFFF,
+}
+
+impl std::fmt::Display for Op {
+    // This trait requires `fmt` with this exact signature.
+    fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Op::Accept => write!(f, "Op(Accept)"),
+            Op::Timeout => write!(f, "Op(Timeout)"),
+            Op::Recv => write!(f, "Op(Recv)"),
+            Op::Send => write!(f, "Op(Send)"),
+            Op::Other => write!(f, "Op(Other)"),
+        }
+    }
 }
 
 impl Op {

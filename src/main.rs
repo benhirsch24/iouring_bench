@@ -1,7 +1,9 @@
 use clap::{Parser};
+use histogram::Histogram;
 use io_uring::{opcode, types};
-use log::{error, info};
+use log::{debug, error, info, trace, warn};
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
@@ -68,12 +70,152 @@ fn main() -> Result<(), std::io::Error> {
         .user_data(timeout_ud.into_u64());
     uring::submit(timeout).expect("arm timeout");
 
-    if let Err(e) = uring::run(move |fd| {
-        let mut req = CachingRequest::new(fd, cache.clone(), args.chunk_size);
-        // Arm the first read
-        // TODO: multishot recv
-        uring::submit(req.read())?;
-        Ok(req)
+    let mut requests = HashMap::new();
+    let write_timing_histogram = Rc::new(RefCell::new(Histogram::new(7, 64).expect("histogram")));
+    if let Err(e) = uring::run(move |ud, res, flags| {
+        let fd = ud.fd();
+        let op = ud.op().expect("op");
+        match op {
+            Op::Timeout => {
+                if res != -62 {
+                    warn!("Timeout result not 62: {}", res);
+                }
+
+                let stats = uring::stats()?;
+                info!("Metrics: {}", stats); // TODO: Add to_submit backlog
+
+                info!("submit_and_wait batch sizes");
+                let percentiles = [0.0, 50.0, 90.0, 99.0, 99.9, 99.99, 100.0];
+                if let Some(ps) = stats.submit_and_wait_batch_size.percentiles(&percentiles).expect("saw percentiles") {
+                    for p in ps {
+                        info!("p{} range={:?} count={}", p.0, p.1.range(), p.1.count());
+                    }
+                }
+
+                let percentiles = [0.0, 50.0, 90.0, 99.0, 100.0];
+                if let Some(ps) = write_timing_histogram.borrow().percentiles(&percentiles).expect("percentiles") {
+                    debug!("Median time betwen writes for a request={}", ps[1].1.count());
+                }
+            },
+            Op::Accept => {
+                if res == 127 {
+                    error!("Failed to accept");
+                    return Ok(());
+                }
+                debug!("Accept! flags: {} result: {} ud: {}", flags, res, ud);
+
+                // Create a new request object around this file descriptor and enqueue the
+                // first read
+                // TODO: multishot recv
+                let mut req = CachingRequest::new(types::Fd(res), cache.clone(), write_timing_histogram.clone(), args.chunk_size);
+                uring::submit(req.read()).expect("read submit");
+                requests.insert(res, req);
+            },
+            Op::Recv => {
+                trace!("Recv CQE result={} flags={} user_data={}", res, flags, ud);
+                if res == -1 {
+                    error!("Request error: {}", fd);
+                    unsafe { libc::close(fd); };
+                    requests.remove(&fd);
+                    return Ok(());
+                }
+                if res == 0 {
+                    unsafe { libc::close(fd); };
+                    requests.remove(&fd);
+                    return Ok(());
+                }
+                if res < 0 {
+                    let error = match -res {
+                        libc::EFAULT => "efault",
+                        libc::EPIPE => "epipe",
+                        libc::EIO => "eio",
+                        libc::EINVAL => "einval",
+                        libc::EBADF => "ebadf",
+                        104 => "connection reset by peer",
+                        _ => "other",
+                    };
+                    error!("Error reading: {} {} {}", fd, res, error);
+                    unsafe { libc::close(fd); };
+                    requests.remove(&fd);
+                    return Ok(());
+                }
+
+                // Get the request out of our outstanding requests hashmap
+                let req = match requests.get_mut(&fd) {
+                    Some(r) => r,
+                    None => {
+                        warn!("No outstanding request for flags: {} result: {} ud: {}", flags, res, ud);
+                    return Ok(());
+                    },
+                };
+
+                match req.handle(op, res) {
+                    Ok(RequestState::Done) => {
+                        unsafe { libc::close(fd); };
+                        requests.remove(&fd);
+                    },
+                    Ok(_) => trace!("handled"),
+                    Err(e) => {
+                        error!("Error when handling: {}", e);
+                    return Ok(());
+                    }
+                };
+            },
+            Op::Send => {
+                trace!("Send CQE result={} flags={} user_data={}", res, flags, ud);
+                if res == -1 {
+                    error!("Request error: {}", fd);
+                    unsafe { libc::close(fd); };
+                    requests.remove(&fd);
+                    return Ok(());
+                }
+                if res == 0 {
+                    unsafe { libc::close(fd); };
+                    requests.remove(&fd);
+                    return Ok(());
+                }
+                if res < 0 {
+                    let error = match -res {
+                        libc::EFAULT => "efault",
+                        libc::EPIPE => "epipe",
+                        libc::EIO => "eio",
+                        libc::EINVAL => "einval",
+                        libc::EBADF => "ebadf",
+                        104 => "connection reset by peer",
+                        _ => "other",
+                    };
+                    error!("Error writing: {} {} {}", fd, res, error);
+                    unsafe { libc::close(fd); };
+                    requests.remove(&fd);
+                    return Ok(());
+                }
+
+                // Get the request out of our outstanding requests hashmap
+                let req = match requests.get_mut(&fd) {
+                    Some(r) => r,
+                    None => {
+                        warn!("No outstanding request for flags: {} result: {} ud: {}", flags, res, ud);
+                    return Ok(());
+                    },
+                };
+
+                match req.handle(op, res) {
+                    Ok(RequestState::Done) => {
+                        unsafe { libc::close(fd); };
+                        requests.remove(&fd);
+                    },
+                    Ok(_) => trace!("handled"),
+                    Err(e) => {
+                        error!("Error when handling: {}", e);
+                    return Ok(());
+                    }
+                };
+            },
+            _ => {
+                warn!("Unrecognized opcode cqe flags={} result={} user_data={}", flags, res, ud);
+            },
+        }
+        Ok(())
     }) {
         error!("Error running uring: {}", e);
     }
