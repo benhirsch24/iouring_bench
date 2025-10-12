@@ -108,7 +108,6 @@ fn main() -> Result<(), std::io::Error> {
 
                 // Create a new request object around this file descriptor and enqueue the
                 // first read
-                // TODO: multishot recv
                 let mut conn = Connection::new(
                     types::Fd(res),
                     cache.clone(),

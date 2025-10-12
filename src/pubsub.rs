@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::RawFd;
 use std::rc::Rc;
 
@@ -9,7 +9,7 @@ use bytes::Bytes;
 use io_uring::{opcode, squeue::Entry, types};
 
 pub struct PubsubState {
-    subscribers: HashMap<String, Vec<RawFd>>,
+    subscribers: HashMap<String, HashSet<RawFd>>,
 }
 
 impl PubsubState {
@@ -21,13 +21,19 @@ impl PubsubState {
 
     pub fn subscribe(&mut self, channel: String, fd: RawFd) {
         self.subscribers.entry(channel)
-            .or_insert_with(Vec::new)
-            .push(fd);
+            .or_insert_with(HashSet::new)
+            .insert(fd);
     }
 
-    pub fn get_subscribers(&self, channel: &String) -> Vec<RawFd> {
+    pub fn remove(&mut self, channel: &String, fd: RawFd) {
+        if let Some(e) = self.subscribers.get_mut(channel) {
+            e.remove(&fd);
+        }
+    }
+
+    pub fn get_subscribers(&self, channel: &String) -> HashSet<RawFd> {
         if !self.subscribers.contains_key(channel) {
-            return Vec::new()
+            return HashSet::new()
         }
         self.subscribers.get(channel).unwrap().clone()
     }
@@ -38,7 +44,7 @@ pub struct Buffer {
 }
 
 impl Buffer {
-    pub fn new(buf: Bytes, subscriber_fds: Vec<RawFd>) -> Buffer {
+    pub fn new(buf: Bytes, subscriber_fds: HashSet<RawFd>) -> Buffer {
         let mut subscribers = HashMap::new();
         for subscriber in subscriber_fds {
             // Each subscriber has a reference to the buffer

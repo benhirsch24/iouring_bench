@@ -1,7 +1,7 @@
 use bytes::{Bytes, BytesMut};
 use histogram::Histogram;
 use io_uring::{opcode, squeue::Entry, types};
-use log::{info, trace, warn};
+use log::{debug, info, trace, warn};
 
 use std::collections::HashMap;
 use std::cell::RefCell;
@@ -251,6 +251,14 @@ impl Connection {
         let subscribers = self.ps_state.borrow().get_subscribers(channel);
         info!("There are {} subscribers for {}, messages: {:?}", subscribers.len(), channel, messages);
 
+        // Don't bother allocating buffers and such when there's no subscribers
+        if subscribers.len() == 0 {
+            debug!("No subscribers for {channel}, not doing anything");
+            let e = self.read();
+            uring::submit(e)?;
+            return Ok(ConnectionResult::Continue);
+        }
+
         // Send each message to each subscriber
         for message in messages {
             // Create a new buffer with a refcount per subscriber
@@ -297,6 +305,19 @@ impl Connection {
             }
         };
         Ok(ConnectionResult::Continue)
+    }
+
+    fn close(&mut self) -> anyhow::Result<()> {
+        match &self.connection_state {
+            ConnectionState::Subscriber(c) => {
+                info!("Closing subscriber for {c}");
+                self.ps_state.borrow_mut().remove(c, self.fd.0);
+            },
+            ConnectionState::Publisher(_) => {
+            },
+            _ => panic!("Didn't expect you at close")
+        }
+        Ok(())
     }
 
     fn serve_http(&mut self) -> anyhow::Result<ConnectionResult> {
@@ -362,8 +383,7 @@ impl Connection {
             },
             Op::Recv => {
                 if result == 0 {
-                    // TODO
-                    // self.close()?;
+                    self.close()?;
                     return Ok(ConnectionResult::Done);
                 }
 
