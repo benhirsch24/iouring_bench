@@ -4,8 +4,6 @@ use log::{error, trace};
 
 use std::cell::UnsafeCell;
 
-use crate::user_data::UserData;
-
 pub struct UringArgs {
     pub uring_size: u32,
     pub submissions_threshold: usize,
@@ -75,7 +73,7 @@ pub fn init(args: UringArgs) -> Result<(), std::io::Error> {
 
 pub fn run<H>(handler: H) -> Result<(), anyhow::Error>
     where
-        H: FnMut(UserData, i32, u32) -> Result<(), anyhow::Error>,
+        H: FnMut(u64, i32, u32) -> Result<(), anyhow::Error>,
 {
     URING.with(|uring| {
         unsafe {
@@ -135,7 +133,7 @@ impl Uring {
 
     fn run<H>(&mut self, mut handler: H) -> Result<(), anyhow::Error>
     where
-        H: FnMut(UserData, i32, u32) -> Result<(), anyhow::Error>,
+        H: FnMut(u64, i32, u32) -> Result<(), anyhow::Error>,
     {
         loop {
             let mut completed = 0;
@@ -146,9 +144,8 @@ impl Uring {
                 self.stats.completions_last_period += 1;
                 completed += 1;
                 trace!("completion result={} ud={}", e.result(), e.user_data());
-                let ud = UserData::try_from(e.user_data()).expect("failed userdata extract");
-                if let Err(err) = handler(ud, e.result(), e.flags()) {
-                    error!("Error handling cqe (fd={} res={}): {err}", ud.fd(), e.result());
+                if let Err(err) = handler(e.user_data(), e.result(), e.flags()) {
+                    error!("Error handling cqe (ud={} res={}): {err}", e.user_data(), e.result());
                 }
             }
 
