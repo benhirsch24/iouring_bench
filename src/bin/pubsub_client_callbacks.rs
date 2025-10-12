@@ -1,5 +1,5 @@
 use io_uring::{opcode, types};
-use log::{error, info, warn};
+use log::{debug, error, info, trace, warn};
 use bytes::{BufMut, Bytes, BytesMut};
 
 use std::collections::HashMap;
@@ -9,7 +9,6 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::rc::Rc;
 
 use iouring_bench::uring;
-use iouring_bench::user_data::{Op, UserData};
 
 struct PublisherInner {
     conn: TcpStream,
@@ -93,7 +92,6 @@ impl Publisher {
                         let ud = add_callback({
                             let inner = inner.clone();
                             move |_res| {
-                                info!("Done!");
                                 inner.borrow_mut().conn.shutdown(std::net::Shutdown::Both)?;
                                 Ok(())
                             }
@@ -172,6 +170,16 @@ pub fn call_back(id: u64, res: i32) -> anyhow::Result<()> {
     })
 }
 
+fn read_line(mut buf: BytesMut) -> Option<Bytes> {
+    for idx in 0..buf.len() {
+        if buf[idx] == b'\n' && buf[idx-1] == b'\r' {
+            let b = buf.split_to(idx+1).freeze();
+            return Some(b);
+        }
+    }
+    None
+}
+
 fn main() -> anyhow::Result<()> {
     env_logger::init();
 
@@ -190,13 +198,70 @@ fn main() -> anyhow::Result<()> {
         .user_data(0);
     uring::submit(timeout).expect("arm timeout");
 
+    // Spawn 5 subscribers
+    let num_subscribers = 5;
+    let dones = Rc::new(RefCell::new(num_subscribers));
+    for _ in 0..num_subscribers {
+        let dones = dones.clone();
+        let subscriber = TcpStream::connect("127.0.0.1:8080")?;
+        info!("Sending subscribe");
+        let mut send = BytesMut::with_capacity(1024);
+        send.put_slice(b"SUBSCRIBE ch\r\n");
+        let ptr = send.as_ptr();
+        let n = send.len();
+        let op = opcode::Send::new(types::Fd(subscriber.as_raw_fd()), ptr, n.try_into().unwrap());
+        let ud = add_callback(move |res| {
+            // Sending SUBSCRIBE completion
+            trace!("Sent subscribe res={res}");
+            let _ = send.split();
+            let mut ok = BytesMut::with_capacity(1024);
+            let ptr = ok.as_mut_ptr();
+            let op = opcode::Recv::new(types::Fd(subscriber.as_raw_fd()), ptr, ok.capacity() as u32);
+            let ud = add_callback(move |res| {
+                // Expected OK receive completion
+                trace!("Recv res={res}");
+                unsafe { ok.set_len(res.try_into()?) };
+                let line = read_line(ok).expect("There should be one read by now");
+                if line != "OK\r\n" {
+                    anyhow::bail!("Expected OK");
+                }
+
+                let mut read = BytesMut::with_capacity(1024);
+                let ptr = read.as_mut_ptr();
+                let op = opcode::Recv::new(types::Fd(subscriber.as_raw_fd()), ptr, read.capacity() as u32);
+                let ud = add_callback(move |res| {
+                    // Expected message1 completion
+                    if res < 0 {
+                        anyhow::bail!("Got negative return from receive: {res} fd={}", subscriber.as_raw_fd());
+                    }
+                    trace!("Received message res={res}");
+                    unsafe { read.set_len(res.try_into()?) };
+                    let line = read_line(read).expect("There should be one message");
+                    let msg = std::str::from_utf8(line.as_ref())?;
+                    info!("Subscriber received message {msg}");
+                    *dones.borrow_mut() -= 1;
+                    if *dones.borrow() == 0 {
+                        uring::exit();
+                    }
+                    Ok(())
+                });
+                uring::submit(op.build().user_data(ud))?;
+                Ok(())
+            });
+            uring::submit(op.build().user_data(ud))?;
+            Ok(())
+        });
+        let e = op.build().user_data(ud);
+        uring::submit(e)?;
+    }
+
     // Then publisher who will send
     let mut p = Publisher::new();
-    info!("Publisher {}", p.inner.borrow().fd);
+    debug!("Publisher {}", p.inner.borrow().fd);
     p.send_hi()?;
 
     if let Err(e) = uring::run(move |ud, res, _flags| {
-        info!("Got completion event ud={ud} res={res}");
+        trace!("Got completion event ud={ud} res={res}");
         match ud {
             // Timeout
             0 => {
@@ -216,5 +281,6 @@ fn main() -> anyhow::Result<()> {
     }) {
         error!("Error running uring: {}", e);
     }
+    info!("Exiting");
     Ok(())
 }

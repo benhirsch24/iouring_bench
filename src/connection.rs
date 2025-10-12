@@ -320,7 +320,7 @@ impl Connection {
             ConnectionState::Publisher(_) => {
                 info!("Closing publisher");
             },
-            _ => panic!("Didn't expect you at close")
+            _ => log::error!("Didn't expect you at close")
         }
         Ok(())
     }

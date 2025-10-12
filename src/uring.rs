@@ -46,6 +46,7 @@ pub struct Uring {
     args: UringArgs,
     to_submit: Vec<Entry>,
     stats: UringStats,
+    done: bool,
 }
 
 // Unsafe cell is used because we are using thread-local storage and there will be only one uring
@@ -98,6 +99,18 @@ pub fn submit(sqe: Entry) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+pub fn exit() {
+    URING.with(|uring| {
+        unsafe {
+            let uring_ref = &mut *uring.get();
+            match uring_ref.as_mut() {
+                Some(u) => u.exit(),
+                None => panic!("uring not initialized")
+            }
+        }
+    });
+}
+
 pub fn stats() -> Result<UringStats, std::io::Error> {
     URING.with(|uring| {
         unsafe {
@@ -126,9 +139,14 @@ impl Uring {
         Ok(Uring {
             uring,
             args,
+            done: false,
             to_submit: Vec::new(),
             stats: UringStats::new(),
         })
+    }
+
+    fn exit(&mut self) {
+        self.done = true;
     }
 
     fn run<H>(&mut self, mut handler: H) -> Result<(), anyhow::Error>
@@ -136,6 +154,10 @@ impl Uring {
         H: FnMut(u64, i32, u32) -> Result<(), anyhow::Error>,
     {
         loop {
+            if self.done {
+                break;
+            }
+
             let mut completed = 0;
 
             // Check for completions
