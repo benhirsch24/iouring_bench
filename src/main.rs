@@ -11,6 +11,7 @@ use std::rc::Rc;
 pub mod connection;
 use connection::*;
 pub mod pubsub;
+use pubsub::BufferPool;
 pub mod uring;
 pub mod user_data;
 use user_data::{Op, UserData};
@@ -71,6 +72,7 @@ fn main() -> Result<(), std::io::Error> {
     uring::submit(timeout).expect("arm timeout");
 
     let mut connections = HashMap::new();
+    let buffer_pool = BufferPool::new();
     let write_timing_histogram = Rc::new(RefCell::new(Histogram::new(7, 64).expect("histogram")));
     if let Err(e) = uring::run(move |ud, res, flags| {
         let fd = ud.fd();
@@ -111,6 +113,7 @@ fn main() -> Result<(), std::io::Error> {
                     types::Fd(res),
                     cache.clone(),
                     ps_state.clone(),
+                    buffer_pool.clone(),
                     write_timing_histogram.clone(),
                     args.chunk_size,
                 );

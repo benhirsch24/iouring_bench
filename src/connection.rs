@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::pubsub::{PubsubState};
+use crate::pubsub::{Buffer, BufferPool, PubsubState};
 use crate::user_data::{Op, UserData};
 use crate::uring;
 
@@ -28,6 +28,23 @@ enum ConnectionState {
     Subscriber(String)
 }
 
+impl ConnectionState {
+    fn get_channel(&self) -> String {
+        match self {
+            ConnectionState::Publisher(c) => c.clone(),
+            ConnectionState::Subscriber(c) => c.clone(),
+            _ => panic!("No channel")
+        }
+    }
+
+    fn is_subscriber(&self) -> bool {
+        match self {
+            ConnectionState::Subscriber(_) => true,
+            _ => false
+        }
+    }
+}
+
 pub struct Connection {
     fd: types::Fd,
     read_buffer: BytesMut,
@@ -36,6 +53,7 @@ pub struct Connection {
     cache: Rc<HashMap<String, String>>,
     connection_state: ConnectionState,
     ps_state: Rc<RefCell<PubsubState>>,
+    buffer_pool: BufferPool,
     sent: usize,
     chunk_size: usize,
     write_timing_histogram: Rc<RefCell<Histogram>>,
@@ -43,7 +61,7 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub fn new(fd: types::Fd, cache: Rc<HashMap<String, String>>, ps_state: Rc<RefCell<PubsubState>>, write_timing_histogram: Rc<RefCell<Histogram>>, chunk_size: usize) -> Connection {
+    pub fn new(fd: types::Fd, cache: Rc<HashMap<String, String>>, ps_state: Rc<RefCell<PubsubState>>, buffer_pool: BufferPool, write_timing_histogram: Rc<RefCell<Histogram>>, chunk_size: usize) -> Connection {
         Connection {
             fd,
             read_buffer: BytesMut::with_capacity(BUFFER_SIZE),
@@ -52,6 +70,7 @@ impl Connection {
             connection_state: ConnectionState::Init,
             cache,
             ps_state,
+            buffer_pool,
             sent: 0,
             chunk_size,
             write_timing_histogram,
@@ -129,10 +148,10 @@ impl Connection {
                 }
             },
             ConnectionState::Publisher(_) => {
-                self.publish()
+                self.publish_recv()
             },
             ConnectionState::Subscriber(_) => {
-                self.subscribe()
+                self.subscribe_recv()
             },
             ConnectionState::Http => {
                 unimplemented!("Keep alive and multiple reads not implemented yet")
@@ -249,7 +268,7 @@ impl Connection {
         None
     }
 
-    fn publish(&mut self) -> anyhow::Result<ConnectionResult> {
+    fn publish_recv(&mut self) -> anyhow::Result<ConnectionResult> {
         // Get messages from buffer. Each message is one line.
         let mut messages = vec![];
         while let Some(msg) = self.read_line() {
@@ -263,13 +282,23 @@ impl Connection {
         let subscribers = self.ps_state.borrow().get_subscribers(channel);
         info!("There are {} subscribers for {}, messages: {:?}", subscribers.len(), channel, messages);
 
+        // Send each message to each subscriber
+        for message in messages {
+            // Create a new buffer with a refcount per subscriber
+            let mut buf = Buffer::new(message, subscribers.clone());
+            for s in buf.get_sends() {
+                uring::submit(s)?;
+            }
+            self.buffer_pool.register(channel.clone(), buf);
+        }
+
         // Issue read for next message
         let e = self.read();
         uring::submit(e)?;
         Ok(ConnectionResult::Continue)
     }
 
-    fn subscribe(&mut self) -> anyhow::Result<ConnectionResult> {
+    fn subscribe_recv(&mut self) -> anyhow::Result<ConnectionResult> {
         // The only valid read result from a subscriber is a BYE message
         if let Some(msg) = self.read_line() {
             if &msg == "BYE\r\n" {
@@ -281,6 +310,22 @@ impl Connection {
                 return Ok(ConnectionResult::Done);
             }
         }
+        Ok(ConnectionResult::Continue)
+    }
+
+    fn subscribe_send(&mut self, n: usize) -> anyhow::Result<ConnectionResult> {
+        let c = self.connection_state.get_channel();
+        let e = self.buffer_pool.get_send_for_buffer(&c, self.fd.0, n);
+        match e {
+            Some(e) => {
+                uring::submit(e)?;
+            },
+            None => {
+                if self.buffer_pool.is_done(&c) {
+                    self.buffer_pool.remove(&c);
+                }
+            }
+        };
         Ok(ConnectionResult::Continue)
     }
 
@@ -360,6 +405,18 @@ impl Connection {
                 self.serve()?;
             },
             Op::Send => {
+                if self.connection_state.is_subscriber() {
+                    info!("Got send for subscriber fd={} res={result}", self.fd.0);
+                    // We expect the first send to finish
+                    if self.sent < self.response.as_ref().unwrap().len() {
+                        self.send(result.try_into().unwrap());
+                        return Ok(ConnectionResult::Continue);
+                    }
+
+                    // If we've sent the full response then this is a subscribe send
+                    return self.subscribe_send(result.try_into().unwrap());
+                }
+
                 // TODO: No http keep alive implemented yet
                 let res = self.send(result.try_into().unwrap());
                 let done = res.is_none();
