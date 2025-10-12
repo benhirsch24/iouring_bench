@@ -75,6 +75,7 @@ fn main() -> Result<(), std::io::Error> {
     let buffer_pool = BufferPool::new();
     let write_timing_histogram = Rc::new(RefCell::new(Histogram::new(7, 64).expect("histogram")));
     if let Err(e) = uring::run(move |ud, res, flags| {
+        let ud = UserData::try_from(ud).map_err(|_| anyhow::anyhow!("failed userdata extract"))?;
         let fd = ud.fd();
         let op = ud.op().map_err(|e| anyhow::anyhow!("unknown op code {e}"))?;
         match op {

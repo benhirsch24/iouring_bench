@@ -301,6 +301,7 @@ fn main() -> anyhow::Result<()> {
     connections.insert(p.fd, Box::new(p));
 
     if let Err(e) = uring::run(move |ud, res, flags| {
+        let ud = UserData::try_from(ud).map_err(|_| anyhow::anyhow!("failed userdata extract"))?;
         let fd = ud.fd();
         let op = ud.op().map_err(|e| anyhow::anyhow!("unknown op code {e}"))?;
         match op {
@@ -401,7 +402,7 @@ fn main() -> anyhow::Result<()> {
                     Ok(_) => trace!("handled"),
                     Err(e) => {
                         error!("Error when handling: {}", e);
-                    return Ok(());
+                        return Ok(());
                     }
                 };
             },
