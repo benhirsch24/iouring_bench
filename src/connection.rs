@@ -223,6 +223,10 @@ impl Connection {
         uring::submit(send)?;
         self.connection_state = ConnectionState::Subscriber(channel);
 
+        // Right now this just checks for the socket closing
+        let read = self.read();
+        uring::submit(read)?;
+
         Ok(ConnectionResult::Continue)
     }
 
@@ -314,6 +318,7 @@ impl Connection {
                 self.ps_state.borrow_mut().remove(c, self.fd.0);
             },
             ConnectionState::Publisher(_) => {
+                info!("Closing publisher");
             },
             _ => panic!("Didn't expect you at close")
         }
