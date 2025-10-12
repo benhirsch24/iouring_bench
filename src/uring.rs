@@ -1,6 +1,6 @@
 use io_uring::{IoUring, squeue::Entry};
 use histogram::Histogram;
-use log::{debug, error, trace};
+use log::{error, trace};
 
 use std::cell::UnsafeCell;
 
@@ -73,9 +73,9 @@ pub fn init(args: UringArgs) -> Result<(), std::io::Error> {
     })
 }
 
-pub fn run<H>(handler: H) -> Result<(), std::io::Error>
+pub fn run<H>(handler: H) -> Result<(), anyhow::Error>
     where
-        H: FnMut(UserData, i32, u32) -> Result<(), std::io::Error>,
+        H: FnMut(UserData, i32, u32) -> Result<(), anyhow::Error>,
 {
     URING.with(|uring| {
         unsafe {
@@ -91,8 +91,10 @@ pub fn submit(sqe: Entry) -> Result<(), std::io::Error> {
     URING.with(|uring| {
         unsafe {
             let uring_ref = &mut *uring.get();
-            let uring_mut = uring_ref.as_mut().unwrap();
-            uring_mut.submit(sqe)
+            match uring_ref.as_mut() {
+                Some(u) => u.submit(sqe),
+                None => panic!("uring not initialized")
+            }
         }
     });
     Ok(())
@@ -131,9 +133,9 @@ impl Uring {
         })
     }
 
-    fn run<H>(&mut self, mut handler: H) -> Result<(), std::io::Error>
+    fn run<H>(&mut self, mut handler: H) -> Result<(), anyhow::Error>
     where
-        H: FnMut(UserData, i32, u32) -> Result<(), std::io::Error>,
+        H: FnMut(UserData, i32, u32) -> Result<(), anyhow::Error>,
     {
         loop {
             let mut completed = 0;
@@ -168,7 +170,7 @@ impl Uring {
             if should_sqpoll_submit || completed == 0 {
                 let batch: Vec<io_uring::squeue::Entry> = self.to_submit.drain(..).collect();
                 unsafe { self.uring.submission().push_multiple(&batch) }.expect("push multiple");
-                debug!("Submit and wait last_submit={} backlog={} batch_size={} t_diff={}", self.stats.last_submit.elapsed().as_millis(), self.to_submit.len(), batch.len(), self.stats.last_submit.elapsed().as_micros());
+                trace!("Submit and wait last_submit={} backlog={} batch_size={} t_diff={}", self.stats.last_submit.elapsed().as_millis(), self.to_submit.len(), batch.len(), self.stats.last_submit.elapsed().as_micros());
                 self.stats.submit_and_wait_batch_size.increment(batch.len() as u64).unwrap();
                 self.stats.submit_and_wait += 1;
                 self.stats.last_submit = std::time::Instant::now();

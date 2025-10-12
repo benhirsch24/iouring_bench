@@ -13,3 +13,21 @@ I've tested using [vegeta](https://pkg.go.dev/github.com/tsenart/vegeta/v12) usi
 `echo "GET http://<IP>:8080/object/1" | ./vegeta attack -duration=60s -rate=1000/1s | tee results.bin | ./vegeta report`
 
 And mostly tested on EC2 c7g.8xlarge for now, with plans to go bigger.
+
+## Pubsub
+
+Added pubsub capabilities.
+
+```
+nc -C 127.0.0.1 8080
+> PUBLISH ch
+< OK
+> hello
+```
+
+```
+nc -C 127.0.0.1 8080
+> SUBSCRIBE ch
+< OK
+< hello
+```
