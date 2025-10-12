@@ -38,12 +38,11 @@ pub struct Buffer {
 }
 
 impl Buffer {
-    pub fn new(message: String, subscriber_fds: Vec<RawFd>) -> Buffer {
-        let buf = Bytes::copy_from_slice(message.as_bytes());
+    pub fn new(buf: Bytes, subscriber_fds: Vec<RawFd>) -> Buffer {
         let mut subscribers = HashMap::new();
         for subscriber in subscriber_fds {
             // Each subscriber has a reference to the buffer
-            subscribers.insert(subscriber, BufferSubscriber::new(subscriber, buf.slice(..)));
+            subscribers.insert(subscriber, BufferSubscriber::new(subscriber, buf.clone()));
         }
         Buffer {
             subscribers,

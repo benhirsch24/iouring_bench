@@ -169,32 +169,18 @@ impl Connection {
         // First check the protocol matches. Expect at least 8 for "PUBLISH "
         // TODO: Error handling
         // TODO: Will an error here close the socket? It should.
-        if self.read_buffer.len() < 8 {
-            anyhow::bail!("expected at least 8 characters got {}", self.read_buffer.len());
+        let line = match self.read_line() {
+            Some(l) => l,
+            None => { return Ok(ConnectionResult::Continue); }
+        };
+
+        let line = std::str::from_utf8(line.as_ref()).unwrap().trim();
+        if !line.starts_with("PUBLISH") {
+            anyhow::bail!("Expected publish");
         }
 
-        let protocol = std::str::from_utf8(&self.read_buffer[..8])
-            .map_err(|e| anyhow::anyhow!("failed to parse \"PUBLISH \": {e}"))?;
-        if protocol != "PUBLISH " {
-            anyhow::bail!("wrong protocol: {protocol}");
-        }
+        let channel = line[8..].to_string();
 
-        // Get the channel to publish on by finding the carriage return
-        let mut ch_end_idx = 0;
-        for idx in 8..self.read_buffer.len() {
-            let c = self.read_buffer[idx];
-            if c == b'\n' {
-                if self.read_buffer[idx-1] == b'\r' {
-                    ch_end_idx = idx-1;
-                    break;
-                }
-            }
-        }
-
-        if ch_end_idx == 0 {
-            anyhow::bail!("Never found channel {}", std::str::from_utf8(&self.read_buffer[..]).unwrap());
-        }
-        let channel = std::str::from_utf8(&self.read_buffer[8..ch_end_idx]).expect("channel").to_string();
         info!("Found channel {channel}");
         self.read_start += self.read_buffer.len();
 
@@ -217,33 +203,17 @@ impl Connection {
         // First check the protocol matches. Expect at least 10 for "SUBSCRIBE "
         // TODO: Error handling
         // TODO: Will an error here close the socket? It should.
-        if self.read_buffer.len() < 10 {
-            anyhow::bail!("expected at least 10 characters got {}", self.read_buffer.len());
+        let line = match self.read_line() {
+            Some(l) => l,
+            None => { return Ok(ConnectionResult::Continue); }
+        };
+
+        let line = std::str::from_utf8(line.as_ref()).unwrap().trim();
+        if !line.starts_with("SUBSCRIBE") {
+            anyhow::bail!("Expected subscribe");
         }
 
-        let protocol = std::str::from_utf8(&self.read_buffer[..10])
-            .map_err(|e| anyhow::anyhow!("failed to parse \"SUBSCRIBE \": {e}"))?;
-        if protocol != "SUBSCRIBE " {
-            anyhow::bail!("wrong protocol: {protocol}");
-        }
-
-        // Get the channel to publish on by finding the carriage return
-        let mut ch_end_idx = 0;
-        for idx in 10..self.read_buffer.len() {
-            let c = self.read_buffer[idx];
-            if c == b'\n' {
-                if self.read_buffer[idx-1] == b'\r' {
-                    ch_end_idx = idx-1;
-                    break;
-                }
-            }
-        }
-
-        if ch_end_idx == 0 {
-            anyhow::bail!("Never found channel");
-        }
-
-        let channel = std::str::from_utf8(&self.read_buffer[10..ch_end_idx]).expect("channel string").to_string();
+        let channel = line[10..].to_string();
         info!("Subscribing to {channel}");
         self.ps_state.borrow_mut().subscribe(channel.clone(), self.fd.0);
 
@@ -256,13 +226,12 @@ impl Connection {
         Ok(ConnectionResult::Continue)
     }
 
-    fn read_line(&mut self) -> Option<String> {
+    fn read_line(&mut self) -> Option<Bytes> {
         for idx in self.read_start..self.read_buffer.len() {
             if self.read_buffer[idx] == b'\n' && self.read_buffer[idx-1] == b'\r' {
-                let buf = &self.read_buffer[self.read_start..idx-1];
-                let msg = std::str::from_utf8(buf).unwrap().to_string();
-                self.read_start = idx+1;
-                return Some(msg);
+                let buf = self.read_buffer.split_to(idx+1).freeze();
+                self.read_start = 0;
+                return Some(buf);
             }
         }
         None
@@ -271,9 +240,9 @@ impl Connection {
     fn publish_recv(&mut self) -> anyhow::Result<ConnectionResult> {
         // Get messages from buffer. Each message is one line.
         let mut messages = vec![];
-        while let Some(msg) = self.read_line() {
-            info!("Read msg {msg}");
-            messages.push(msg);
+        while let Some(line) = self.read_line() {
+            info!("Read msg {}", std::str::from_utf8(line.as_ref()).unwrap());
+            messages.push(line);
         }
         let channel = match &self.connection_state {
             ConnectionState::Publisher(c) => c,
@@ -322,6 +291,7 @@ impl Connection {
             },
             None => {
                 if self.buffer_pool.is_done(&c) {
+                    info!("Buffer pool is done for {c}");
                     self.buffer_pool.remove(&c);
                 }
             }
