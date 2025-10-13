@@ -17,6 +17,8 @@ clap = { version = "4.5.48", features = ["derive"] }
 histogram = "0.11.3"
 thiserror = "2.0.17"
 anyhow = "1.0.100"
+clap-duration = "0.1.11"
+duration-human = "0.1.10"
 
 [profile.release]
 opt-level = 3

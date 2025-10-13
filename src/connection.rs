@@ -21,6 +21,7 @@ pub enum ConnectionResult {
     Done,
 }
 
+#[derive(Debug)]
 enum ConnectionState {
     Init,
     Http,
@@ -239,7 +240,7 @@ impl Connection {
         // Get messages from buffer. Each message is one line.
         let mut messages = vec![];
         while let Some(line) = self.read_line() {
-            info!("Read msg {}", std::str::from_utf8(line.as_ref()).unwrap());
+            debug!("Read msg {}", std::str::from_utf8(line.as_ref()).unwrap());
             messages.push(line);
         }
         let channel = match &self.connection_state {
@@ -247,7 +248,7 @@ impl Connection {
             _ => panic!("unexpected")
         };
         let subscribers = self.ps_state.borrow().get_subscribers(channel);
-        info!("There are {} subscribers for {}, messages: {:?}", subscribers.len(), channel, messages);
+        info!("There are {} subscribers for {}, messages: {:?} ({})", subscribers.len(), channel, messages, messages.len());
 
         // Don't bother allocating buffers and such when there's no subscribers
         if subscribers.len() == 0 {
@@ -314,7 +315,7 @@ impl Connection {
             ConnectionState::Publisher(_) => {
                 info!("Closing publisher");
             },
-            _ => log::error!("Didn't expect you at close")
+            _ => log::error!("Called close for unexpected connection state: {:?}", self.connection_state)
         }
         Ok(())
     }
@@ -395,7 +396,7 @@ impl Connection {
             },
             Op::Send => {
                 if self.connection_state.is_subscriber() {
-                    info!("Got send for subscriber fd={} res={result}", self.fd.0);
+                    debug!("Got send for subscriber fd={} res={result}", self.fd.0);
                     // We expect the first send to finish
                     if self.sent < self.response.as_ref().unwrap().len() {
                         self.send(result.try_into().unwrap());
