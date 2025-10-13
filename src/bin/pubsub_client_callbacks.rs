@@ -3,113 +3,11 @@ use log::{debug, error, info, trace, warn};
 use bytes::{BufMut, Bytes, BytesMut};
 
 use std::collections::HashMap;
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::{UnsafeCell};
 use std::net::TcpStream;
 use std::os::fd::{AsRawFd, RawFd};
-use std::rc::Rc;
 
 use iouring_bench::uring;
-
-struct PublisherInner {
-    conn: TcpStream,
-    fd: RawFd,
-    read_buffer: BytesMut,
-    send_buffer: BytesMut,
-}
-
-impl PublisherInner {
-    fn read_line(&mut self) -> Option<Bytes> {
-        let buf = &mut self.read_buffer;
-        for idx in 0..buf.len() {
-            if buf[idx] == b'\n' && buf[idx-1] == b'\r' {
-                let b = buf.split_to(idx+1).freeze();
-                return Some(b);
-            }
-        }
-        None
-    }
-}
-
-#[derive(Clone)]
-struct Publisher {
-    inner: Rc<RefCell<PublisherInner>>,
-}
-
-impl Publisher {
-    fn new() -> Publisher {
-        let conn = TcpStream::connect("127.0.0.1:8080").expect("publish conn");
-        let fd = conn.as_raw_fd();
-        Publisher {
-            inner: Rc::new(RefCell::new(PublisherInner {
-                conn: conn,
-                fd,
-                read_buffer: BytesMut::with_capacity(1024),
-                send_buffer: BytesMut::with_capacity(1024),
-            }))
-        }
-    }
-
-    fn send_hi(&mut self) -> anyhow::Result<()> {
-        let send_e = {
-            let mut inner = self.inner.borrow_mut();
-            inner.send_buffer.put_slice(b"PUBLISH ch\r\n");
-            let ptr = inner.send_buffer.as_ptr();
-            let to_send = inner.send_buffer.len();
-            opcode::Send::new(types::Fd(inner.fd), ptr, to_send.try_into().unwrap())
-        };
-        let ud = add_callback({
-            let inner = self.inner.clone();
-            move |res| {
-                // TODO: What if send is bigger than res?
-                info!("Send completed! res={res}");
-                let read_e = {
-                    let mut inner = inner.borrow_mut();
-                    let ptr = inner.read_buffer.as_mut_ptr();
-                    opcode::Recv::new(types::Fd(inner.fd), ptr, (inner.read_buffer.capacity() - inner.read_buffer.len()) as u32)
-                };
-                let ud = add_callback({
-                    let inner = inner.clone();
-                    move |res: i32| {
-                        let send_e = {
-                            let mut inner = inner.borrow_mut();
-                            info!("Received res={res}");
-                            let newlen: usize = inner.read_buffer.len() + (res as usize);
-                            unsafe {
-                                inner.read_buffer.set_len(newlen)
-                            };
-                            let line = inner.read_line().expect("There should be one read by now");
-                            if line != "OK\r\n" {
-                                anyhow::bail!("Expected OK");
-                            }
-                            // Split removes anything that's been filled already. Put our message in
-                            // to send instead.
-                            let _ = inner.send_buffer.split();
-                            inner.send_buffer.put_slice(b"hello\r\n");
-                            let ptr = inner.send_buffer.as_ptr();
-                            let to_send = inner.send_buffer.len();
-                            opcode::Send::new(types::Fd(inner.fd), ptr, to_send.try_into().unwrap())
-                        };
-                        let ud = add_callback({
-                            let inner = inner.clone();
-                            move |_res| {
-                                inner.borrow_mut().conn.shutdown(std::net::Shutdown::Both)?;
-                                Ok(())
-                            }
-                        });
-                        uring::submit(send_e.build().user_data(ud.into()))?;
-                        Ok(())
-                    }
-                });
-                let e = read_e.build().user_data(ud).into();
-                uring::submit(e)?;
-                Ok(())
-            }
-        });
-        uring::submit(send_e.build().user_data(ud))?;
-        info!("Sending hi ud={ud}");
-        Ok(())
-    }
-}
 
 struct CallbackRegistry {
     map: HashMap<u64, Box<dyn FnOnce(i32) -> anyhow::Result<()>>>,
@@ -180,6 +78,27 @@ fn read_line(mut buf: BytesMut) -> Option<Bytes> {
     None
 }
 
+fn read_message_recursive(fd: RawFd) -> anyhow::Result<()> {
+    let mut read = BytesMut::with_capacity(1024);
+    let ptr = read.as_mut_ptr();
+    let op = opcode::Recv::new(types::Fd(fd), ptr, read.capacity() as u32);
+    let ud = add_callback(move |res| {
+        // Expected message1 completion
+        if res < 0 {
+            anyhow::bail!("Got negative return from receive: {res} fd={}", fd);
+        }
+        trace!("Received message res={res}");
+        unsafe { read.set_len(res.try_into()?) };
+        let line = read_line(read).expect("There should be one message");
+        let msg = std::str::from_utf8(line.as_ref())?;
+        info!("Subscriber received message {msg}");
+        // You lose cancellation but oh well for this example.
+        read_message_recursive(fd)
+    });
+    uring::submit(op.build().user_data(ud))?;
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     env_logger::init();
 
@@ -200,52 +119,35 @@ fn main() -> anyhow::Result<()> {
 
     // Spawn 5 subscribers
     let num_subscribers = 5;
-    let dones = Rc::new(RefCell::new(num_subscribers));
+    let mut subscribers = HashMap::new();
     for _ in 0..num_subscribers {
-        let dones = dones.clone();
         let subscriber = TcpStream::connect("127.0.0.1:8080")?;
-        info!("Sending subscribe");
+        let fd = subscriber.as_raw_fd();
+        subscribers.insert(subscriber.as_raw_fd(), subscriber);
+        info!("Sending subscribe fd={}", fd);
         let mut send = BytesMut::with_capacity(1024);
         send.put_slice(b"SUBSCRIBE ch\r\n");
         let ptr = send.as_ptr();
         let n = send.len();
-        let op = opcode::Send::new(types::Fd(subscriber.as_raw_fd()), ptr, n.try_into().unwrap());
+        let op = opcode::Send::new(types::Fd(fd), ptr, n.try_into().unwrap());
         let ud = add_callback(move |res| {
             // Sending SUBSCRIBE completion
-            trace!("Sent subscribe res={res}");
+            debug!("Sent subscribe res={res}");
             let _ = send.split();
             let mut ok = BytesMut::with_capacity(1024);
             let ptr = ok.as_mut_ptr();
-            let op = opcode::Recv::new(types::Fd(subscriber.as_raw_fd()), ptr, ok.capacity() as u32);
+            let op = opcode::Recv::new(types::Fd(fd), ptr, ok.capacity() as u32);
             let ud = add_callback(move |res| {
                 // Expected OK receive completion
-                trace!("Recv res={res}");
+                debug!("Recv res={res} fd={}", fd);
                 unsafe { ok.set_len(res.try_into()?) };
                 let line = read_line(ok).expect("There should be one read by now");
                 if line != "OK\r\n" {
                     anyhow::bail!("Expected OK");
                 }
+                debug!("Got OK fd={}", fd);
 
-                let mut read = BytesMut::with_capacity(1024);
-                let ptr = read.as_mut_ptr();
-                let op = opcode::Recv::new(types::Fd(subscriber.as_raw_fd()), ptr, read.capacity() as u32);
-                let ud = add_callback(move |res| {
-                    // Expected message1 completion
-                    if res < 0 {
-                        anyhow::bail!("Got negative return from receive: {res} fd={}", subscriber.as_raw_fd());
-                    }
-                    trace!("Received message res={res}");
-                    unsafe { read.set_len(res.try_into()?) };
-                    let line = read_line(read).expect("There should be one message");
-                    let msg = std::str::from_utf8(line.as_ref())?;
-                    info!("Subscriber received message {msg}");
-                    *dones.borrow_mut() -= 1;
-                    if *dones.borrow() == 0 {
-                        uring::exit();
-                    }
-                    Ok(())
-                });
-                uring::submit(op.build().user_data(ud))?;
+                read_message_recursive(fd)?;
                 Ok(())
             });
             uring::submit(op.build().user_data(ud))?;
@@ -255,10 +157,53 @@ fn main() -> anyhow::Result<()> {
         uring::submit(e)?;
     }
 
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
     // Then publisher who will send
-    let mut p = Publisher::new();
-    debug!("Publisher {}", p.inner.borrow().fd);
-    p.send_hi()?;
+    let conn = TcpStream::connect("127.0.0.1:8080").expect("publish conn");
+    let fd = conn.as_raw_fd();
+    let mut send_buffer = BytesMut::with_capacity(4096);
+    send_buffer.put_slice(b"PUBLISH ch\r\n");
+    let ptr = send_buffer.as_ptr();
+    let to_send = send_buffer.len();
+    debug!("Publisher sending");
+    let send_e = opcode::Send::new(types::Fd(fd), ptr, to_send.try_into().unwrap());
+    let ud = add_callback(move |res| {
+        // TODO: What if send is bigger than res?
+        info!("Publisher PUBLISH completed res={res}");
+        let mut read_buffer = BytesMut::with_capacity(4096);
+        let ptr = read_buffer.as_mut_ptr();
+        let read_e = opcode::Recv::new(types::Fd(fd), ptr, read_buffer.capacity() as u32);
+        let ud = add_callback(move |res: i32| {
+            debug!("Publisher OK recv={res}");
+            let newlen: usize = read_buffer.len() + (res as usize);
+            unsafe {
+                read_buffer.set_len(newlen)
+            };
+            let line = read_line(read_buffer).expect("There should be one read by now");
+            if line != "OK\r\n" {
+                anyhow::bail!("Expected OK");
+            }
+            debug!("Publisher received ok");
+
+            let mut send_buffer = BytesMut::with_capacity(4096);
+            send_buffer.put_slice(b"hello\r\n");
+            let ptr = send_buffer.as_ptr();
+            let to_send = send_buffer.len();
+            let send_e = opcode::Send::new(types::Fd(fd), ptr, to_send.try_into().unwrap());
+            let ud = add_callback(move |_res| {
+                info!("Publisher sent message res={res}");
+                Ok(())
+            });
+            uring::submit(send_e.build().user_data(ud.into()))?;
+            Ok(())
+        });
+        let e = read_e.build().user_data(ud).into();
+        uring::submit(e)?;
+        Ok(())
+    });
+    uring::submit(send_e.build().user_data(ud))?;
+    debug!("Publisher {}", fd);
 
     if let Err(e) = uring::run(move |ud, res, _flags| {
         trace!("Got completion event ud={ud} res={res}");

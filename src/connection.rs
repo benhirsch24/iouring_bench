@@ -132,19 +132,13 @@ impl Connection {
             ConnectionState::Init => {
                 // Look at first 4 characters to see if it's PUBL or SUBS or not.
                 // TODO: Could probably do more error handling idk
-                let protocol = std::str::from_utf8(&self.read_buffer[..4])
-                    .map_err(|e| anyhow::anyhow!("failed to parse protocol to uft8: {e}"))?;
-                match protocol {
-                    "PUBL" => {
-                        self.init_publisher()
-                    },
-                    "SUBS" => {
-                        self.init_subscriber()
-                    }
-                    _ => {
-                        self.connection_state = ConnectionState::Http;
-                        self.serve_http()
-                    },
+                if self.read_buffer.starts_with(b"PUBL") {
+                    self.init_publisher()
+                } else if self.read_buffer.starts_with(b"SUBS") {
+                    self.init_subscriber()
+                } else {
+                    self.connection_state = ConnectionState::Http;
+                    self.serve_http()
                 }
             },
             ConnectionState::Publisher(_) => {
