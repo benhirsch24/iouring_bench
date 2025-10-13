@@ -1,4 +1,4 @@
-
+pub mod callbacks;
 pub mod connection;
 pub mod pubsub;
 pub mod uring;
