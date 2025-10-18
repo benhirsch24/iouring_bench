@@ -533,6 +533,7 @@ dependencies = [
  "io-uring",
  "libc",
  "log",
+ "slab",
  "thiserror 2.0.17",
  "tokio",
 ]

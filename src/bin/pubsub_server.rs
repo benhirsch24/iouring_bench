@@ -1,11 +1,12 @@
+use bytes::{BufMut, BytesMut};
 use clap::{Parser};
 use io_uring::{opcode, types};
 use log::{error, info, trace, warn};
-
-use std::os::fd::AsRawFd;
+use std::io::Write;
 
 use iouring_bench::callbacks::*;
 use iouring_bench::uring;
+use iouring_bench::net as unet;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -21,6 +22,81 @@ struct Args {
     /// Interval for kernel submission queue polling. If 0 then sqpoll is disabled. Default 0.
     #[arg(short = 'i', long, default_value_t = 0)]
     sqpoll_interval_ms: u32,
+}
+
+fn send_error_and_then<F>(stream: unet::TcpStream, error_message: String, f: F) -> anyhow::Result<()>
+    where F: FnOnce(i32) -> anyhow::Result<()> + 'static
+{
+    let error = BytesMut::with_capacity(1024);
+    let mut writer = error.writer();
+    let n = writer.write(format!("ERROR {error_message}\r\n").as_bytes())?;
+    let error = writer.into_inner();
+    stream.send(error.as_ptr(), n, move |res| {
+        let _e = error;
+        info!("Error result={res}");
+        f(res)
+    })
+}
+
+fn send_ok_and_then<F>(stream: unet::TcpStream, f: F) -> anyhow::Result<()>
+    where F: FnOnce(i32) -> anyhow::Result<()> + 'static
+{
+    let mut ok = BytesMut::with_capacity(16);
+    ok.put_slice(b"OK\r\n");
+    stream.send(ok.as_ptr(), ok.len(), move |res| {
+        let _o = ok;
+        info!("Ok result res={res}");
+        f(res)
+    })
+}
+
+fn parse_channel(protocol: &BytesMut) -> Option<String> {
+                    info!("P {}", protocol.len());
+    for i in 0..protocol.len(){
+        if protocol[i] == b'\n' && protocol[i-1] == b'\r' {
+            let channel = std::str::from_utf8(&protocol[8..i-1]).expect("channel").to_string();
+            return Some(channel);
+        }
+    }
+    None
+}
+
+fn relay_messages(stream: unet::TcpStream) -> anyhow::Result<()> {
+    Ok(())
+}
+
+fn do_protocol(stream: unet::TcpStream, mut protocol: BytesMut, res: i32) -> anyhow::Result<()> {
+    let l = protocol.len();
+    info!("Protocol res={res} l={l}");
+    unsafe { protocol.set_len(l + res as usize) };
+    let msg = std::str::from_utf8(&protocol[..]).unwrap();
+    info!("Got msg {msg}");
+    if protocol.starts_with(b"PUBLISH") {
+        info!("Is Publisher");
+        if let Some(channel) = parse_channel(&protocol) {
+            info!("We got the channel {channel}");
+            send_ok_and_then(stream, move |res| {
+                info!("Publisher sent ok channel={channel}");
+                relay_messages(stream)
+            })?;
+        } else {
+            let ptr = protocol.as_mut_ptr().wrapping_add(l);
+            let c = protocol.capacity() - l;
+            stream.recv(ptr, c, move |res| do_protocol(stream, protocol, res))?;
+        }
+    } else if protocol.starts_with(b"SUBSCRIBE") {
+        send_ok_and_then(stream, move |res| {
+            info!("Subscriber sent ok");
+            Ok(())
+        })?;
+    } else {
+        send_error_and_then(stream, "not a valid protocol".into(), |res| {
+            info!("And then done");
+            Ok(())
+        })?;
+    }
+
+    Ok(())
 }
 
 fn main() -> anyhow::Result<()> {
@@ -42,11 +118,14 @@ fn main() -> anyhow::Result<()> {
         .user_data(0);
     uring::submit(timeout).expect("arm timeout");
 
-    let listener = std::net::TcpListener::bind("0.0.0.0:8080").expect("tcp listener");
-    let lfd = types::Fd(listener.as_raw_fd());
-    let entry = opcode::AcceptMulti::new(lfd).build();
-    submit_entry(entry, move |res| {
+    let listener = unet::TcpListener::bind("0.0.0.0:8080").expect("tcp listener");
+    listener.accept(move |fd| {
+        let stream = unet::TcpStream::new(fd);
         println!("Accepted");
+        let mut protocol = BytesMut::with_capacity(1024);
+        stream.recv(protocol.as_mut_ptr(), protocol.capacity(), move |res| {
+            do_protocol(stream, protocol, res)
+        })?;
         Ok(())
     })?;
 
@@ -58,7 +137,6 @@ fn main() -> anyhow::Result<()> {
                 if res != -62 {
                     warn!("Timeout result not 62: {}", res);
                 }
-
                 let stats = uring::stats()?;
                 info!("Metrics: {}", stats);
             },
@@ -71,6 +149,5 @@ fn main() -> anyhow::Result<()> {
     }) {
         error!("Error running uring: {}", e);
     }
-    info!("Exiting");
     Ok(())
 }
