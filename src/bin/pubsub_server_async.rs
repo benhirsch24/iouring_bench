@@ -5,6 +5,7 @@ use log::{error, info, trace, warn};
 use std::io::Write;
 
 use iouring_bench::callbacks::*;
+use iouring_bench::executor;
 use iouring_bench::uring;
 use iouring_bench::net as unet;
 
@@ -34,15 +35,20 @@ fn main() -> anyhow::Result<()> {
         sqpoll_interval_ms: args.sqpoll_interval_ms,
     })?;
 
-    let executor = executor::Executor::new();
+    let executor = executor::init();
 
-    executor::spawn(async {
-        let listener = unet::TcpListener::bind("0.0.0.0:8080")?;
+    let task0 = executor::get_next_task_id();
+    executor::schedule(task0, Box::pin(async {
+        let listener = unet::TcpListener::bind("0.0.0.0:8080").unwrap();
         loop {
-            let stream = listener.accept().await?;
+            info!("Accepting");
+            let stream = listener.accept_fut().await.unwrap();
             info!("Got stream: {}", stream.as_raw_fd());
+            ()
         }
-    });
+    }));
+
+    executor::run();
 
     Ok(())
 }

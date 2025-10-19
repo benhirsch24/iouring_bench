@@ -10,6 +10,16 @@ pub struct UringArgs {
     pub sqpoll_interval_ms: u32,
 }
 
+impl Default for UringArgs {
+    fn default() -> UringArgs {
+        UringArgs {
+            uring_size: 1024,
+            submissions_threshold: 256,
+            sqpoll_interval_ms: 0,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct UringStats {
         pub submitted_last_period: u64,
@@ -67,8 +77,8 @@ pub fn init(args: UringArgs) -> Result<(), std::io::Error> {
 
             let new_uring = Uring::new(args)?;
             *uring_ref = Some(new_uring);
-            Ok(())
         }
+        Ok(())
     })
 }
 

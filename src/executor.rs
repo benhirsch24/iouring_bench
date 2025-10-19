@@ -11,7 +11,9 @@ use log::info;
 struct ExecutorInner {
     results: HashMap<u64, i32>,
     tasks: HashMap<u64, Pin<Box<dyn Future<Output = ()>>>>,
-    ud_to_task: HashMap<u64, u64>,
+    op_to_task: HashMap<u64, u64>,
+    next_task_id: u64,
+    next_op_id: u64,
 }
 
 impl ExecutorInner {
@@ -19,24 +21,26 @@ impl ExecutorInner {
         Self {
             results: HashMap::new(),
             tasks: HashMap::new(),
-            ud_to_task: HashMap::new(),
+            op_to_task: HashMap::new(),
+            next_task_id: 0,
+            next_op_id: 0,
         }
     }
 
-    fn handle_completion(&mut self, ud: u64, res: i32, flags: u32) -> Result<(), anyhow::Error> {
-        if !self.ud_to_task.contains_key(&ud) {
-            anyhow::bail!("No completion {ud}");
+    fn handle_completion(&mut self, op: u64, res: i32, flags: u32) -> Result<(), anyhow::Error> {
+        if !self.op_to_task.contains_key(&op) {
+            anyhow::bail!("No completion {op}");
         }
 
-        let task_id  = self.ud_to_task.get(&ud).copied().unwrap();
-        self.results.insert(ud, res);
+        let task_id  = self.op_to_task.get(&op).copied().unwrap();
+        self.results.insert(op, res);
         if self.tasks.contains_key(&task_id) {
             let mut task = self.tasks.remove(&task_id).expect("We just verified");
             let mut ctx = Context::from_waker(Waker::noop());
             match task.as_mut().poll(&mut ctx) {
                 Poll::Ready(_) => {
                     info!("Task complete");
-                    self.results.remove(&ud);
+                    self.results.remove(&op);
                 },
                 Poll::Pending => {
                     self.tasks.insert(task_id, Box::pin(task));
@@ -46,17 +50,118 @@ impl ExecutorInner {
         Ok(())
     }
 
-    fn get_result(&self, ud: u64) -> Option<&i32> {
-        self.results.get(&ud)
+    pub fn run(&mut self) {
+        // Handle task0 first
+        // TODO: I probably do need to evolve this into:
+        // 1. Handle all completions (push ready tasks to ready queue)
+        // 2. Poll ready tasks
+        //
+        // That way I can spawn arbitrary tasks eg timeouts which can be polled after the next
+        // completion queue run. But I'll defer that for a little bit
+        // This block below polls the first task
+        let op = self.get_next_op_id();
+        self.schedule_completion(0, op);
+        self.handle_completion(0, 0, 0);
+
+        // Run the main uring loop using our callback
+        uring::run(|op, res, flags| self.handle_completion(op, res, flags)).expect("running uring");
     }
 
-    fn schedule(&mut self, ud: u64, fut: Pin<Box<dyn Future<Output = ()>>>) {
-        self.tasks.insert(ud, fut);
+    fn get_next_op_id(&mut self) -> u64 {
+        let op = self.next_op_id;
+        self.next_op_id += 1;
+        op
     }
 
-    fn schedule_completion(&mut self, task_id: u64, ud: u64) {
-        self.ud_to_task.insert(ud, task_id);
+    fn get_next_task_id(&mut self) -> u64 {
+        let task = self.next_task_id;
+        self.next_task_id += 1;
+        task
     }
+
+    fn get_result(&self, op: u64) -> Option<i32> {
+        self.results.get(&op).copied()
+    }
+
+    fn schedule(&mut self, task_id: u64, fut: Pin<Box<dyn Future<Output = ()>>>) {
+        self.tasks.insert(task_id, fut);
+    }
+
+    fn schedule_completion(&mut self, task_id: u64, op: u64) {
+        self.op_to_task.insert(op, task_id);
+    }
+}
+
+thread_local! {
+    static EXECUTOR: UnsafeCell<Option<ExecutorInner>> = UnsafeCell::new(None);
+}
+
+pub fn init() {
+    EXECUTOR.with(|exe| {
+        unsafe {
+            let exe = &mut *exe.get();
+            if exe.is_some() {
+                return;
+            }
+
+            let new_exe = ExecutorInner::new();
+            *exe = Some(new_exe);
+        }
+    })
+}
+
+pub fn schedule(task_id: u64, fut: Pin<Box<dyn Future<Output = ()>>>) {
+    EXECUTOR.with(|exe| {
+        unsafe {
+            let exe = &mut *exe.get();
+            exe.as_mut().unwrap().schedule(task_id, fut);
+        }
+    })
+}
+
+pub fn get_next_op_id() -> u64 {
+    EXECUTOR.with(|exe| {
+        unsafe {
+            let exe = &mut *exe.get();
+            exe.as_mut().unwrap().get_next_op_id()
+        }
+    })
+}
+
+pub fn get_next_task_id() -> u64 {
+    EXECUTOR.with(|exe| {
+        unsafe {
+            let exe = &mut *exe.get();
+            exe.as_mut().unwrap().get_next_task_id()
+        }
+    })
+}
+
+pub fn get_result(op_id: u64) -> Option<i32> {
+    EXECUTOR.with(|exe| {
+        unsafe {
+            let exe = &mut *exe.get();
+            exe.as_mut().unwrap().get_result(op_id)
+        }
+    })
+}
+
+pub fn schedule_completion(task_id: u64, op_id: u64) {
+    EXECUTOR.with(|exe| {
+        unsafe {
+            let exe = &mut *exe.get();
+            exe.as_mut().unwrap().schedule_completion(task_id, op_id)
+        }
+    })
+}
+
+pub fn run() {
+    EXECUTOR.with(|exe| {
+        unsafe {
+            let exe = &mut *exe.get();
+            exe.as_mut().unwrap().run()
+        }
+    })
 }
 
 #[derive(Clone)]
@@ -66,42 +171,46 @@ struct Executor {
 
 impl Executor {
     pub fn new() -> Self {
+        // If uring was already initialized this will be a no-op
+        uring::init(uring::UringArgs::default());
         Self {
             inner: Rc::new(UnsafeCell::new(ExecutorInner::new())),
         }
     }
 
-    fn handle_completion(&mut self, ud: u64, res: i32, flags: u32) -> Result<(), anyhow::Error> {
+    fn handle_completion(&mut self, op: u64, res: i32, flags: u32) -> Result<(), anyhow::Error> {
         unsafe {
             let mut inner = &mut *self.inner.get();
-            inner.handle_completion(ud, res, flags)
+            inner.handle_completion(op, res, flags)
         }
     }
 
-    fn schedule(&mut self, ud: u64, fut: Pin<Box<dyn Future<Output = ()>>>) {
+    fn schedule(&mut self, op: u64, fut: Pin<Box<dyn Future<Output = ()>>>) {
         unsafe {
             let mut inner = &mut *self.inner.get();
-            inner.schedule(ud, fut);
+            inner.schedule(op, fut);
         }
     }
 
-    fn schedule_completion(&mut self, task_id: u64, ud: u64) {
+    fn schedule_completion(&mut self, task_id: u64, op: u64) {
         unsafe {
             let mut inner = &mut *self.inner.get();
-            inner.schedule_completion(task_id, ud);
+            inner.schedule_completion(task_id, op);
         }
     }
 
-    fn get_result(&self, ud: u64) -> Option<i32> {
+    fn get_result(&self, op: u64) -> Option<i32> {
         unsafe {
             let mut inner = &mut *self.inner.get();
-            inner.get_result(ud).copied()
+            inner.get_result(op)
         }
     }
 
     pub fn run(&mut self) {
-        // Run the main uring loop using our callback
-        uring::run(|ud, res, flags| self.handle_completion(ud, res, flags)).expect("running uring");
+        unsafe {
+            let mut inner = &mut *self.inner.get();
+            inner.run()
+        }
     }
 }
 
@@ -145,9 +254,9 @@ mod tests {
             let task_id = task_id;
             let res = res.clone();
             async move {
-                let example_future_ud = 7;
-                let fut = Box::pin(ExampleFuture { id: example_future_ud, executor: executor.clone() });
-                executor.schedule_completion(task_id, example_future_ud);
+                let example_future_op = 7;
+                let fut = Box::pin(ExampleFuture { id: example_future_op, executor: executor.clone() });
+                executor.schedule_completion(task_id, example_future_op);
                 fut.await;
                 *res.borrow_mut() = true;
                 ()
