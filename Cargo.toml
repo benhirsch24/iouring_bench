@@ -20,6 +20,7 @@ anyhow = "1.0.100"
 clap-duration = "0.1.11"
 duration-human = "0.1.10"
 slab = "0.4.11"
+futures = "0.3.31"
 
 [profile.release]
 opt-level = 3

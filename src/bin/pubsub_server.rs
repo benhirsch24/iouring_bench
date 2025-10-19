@@ -75,14 +75,14 @@ fn do_protocol(stream: unet::TcpStream, mut protocol: BytesMut, res: i32) -> any
         info!("Is Publisher");
         if let Some(channel) = parse_channel(&protocol) {
             info!("We got the channel {channel}");
-            send_ok_and_then(stream, move |res| {
-                info!("Publisher sent ok channel={channel}");
-                relay_messages(stream)
-            })?;
+            //send_ok_and_then(stream, move |res| {
+            //    info!("Publisher sent ok channel={channel}");
+            //    relay_messages(stream)
+            //})?;
         } else {
             let ptr = protocol.as_mut_ptr().wrapping_add(l);
             let c = protocol.capacity() - l;
-            stream.recv(ptr, c, move |res| do_protocol(stream, protocol, res))?;
+            //stream.recv(ptr, c, move |res| do_protocol(stream, protocol, res))?;
         }
     } else if protocol.starts_with(b"SUBSCRIBE") {
         send_ok_and_then(stream, move |res| {
@@ -123,9 +123,9 @@ fn main() -> anyhow::Result<()> {
         let stream = unet::TcpStream::new(fd);
         println!("Accepted");
         let mut protocol = BytesMut::with_capacity(1024);
-        stream.recv(protocol.as_mut_ptr(), protocol.capacity(), move |res| {
-            do_protocol(stream, protocol, res)
-        })?;
+        //stream.recv(protocol.as_mut_ptr(), protocol.capacity(), move |res| {
+        //    do_protocol(stream, protocol, res)
+        //})?;
         Ok(())
     })?;
 
