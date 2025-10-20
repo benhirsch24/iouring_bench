@@ -1,3 +1,4 @@
+use futures::{AsyncRead, AsyncWrite};
 use io_uring::{opcode, types};
 use log::trace;
 
@@ -74,12 +75,18 @@ impl Future for AcceptFuture {
 
 pub struct TcpStream {
     fd: RawFd,
+    read_op_id: Option<u64>,
+    write_op_id: Option<u64>,
+    close_op_id: Option<u64>,
 }
 
 impl TcpStream {
     pub fn new(fd: RawFd) -> TcpStream {
         TcpStream {
             fd,
+            read_op_id: None,
+            write_op_id: None,
+            close_op_id: None,
         }
     }
 
@@ -101,5 +108,104 @@ impl TcpStream {
         let op = opcode::Send::new(types::Fd(self.fd), ptr, len as u32);
         let ud = add_callback(f);
         Ok(uring::submit(op.build().user_data(ud))?)
+    }
+}
+
+impl AsyncRead for TcpStream {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, futures::io::Error>> {
+        let mut me = self.as_mut();
+
+        // Only allow one read queued on a TcpStream at a time
+        if let Some(op_id) = me.read_op_id.take() {
+            return match executor::get_result(op_id) {
+                Some(res) => {
+                    trace!("Got result {res}");
+                    if res < 0 {
+                        Poll::Ready(Err(std::io::Error::from_raw_os_error(res)))
+                    } else {
+                        Poll::Ready(Ok(res as usize))
+                    }
+                },
+                None => {
+                    Poll::Pending
+                }
+            };
+        }
+
+        let op_id = executor::get_next_op_id();
+        me.read_op_id = Some(op_id);
+        let ptr = buf.as_mut_ptr();
+        let capacity = buf.len() as u32;
+        let op = opcode::Recv::new(types::Fd(me.fd), ptr, capacity);
+        executor::schedule_completion(op_id, false);
+        uring::submit(op.build().user_data(op_id)).expect("submit asyncread");
+
+        Poll::Pending
+    }
+}
+
+impl AsyncWrite for TcpStream {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, futures::io::Error>> {
+        let mut me = self.as_mut();
+
+        // Only allow one read queued on a TcpStream at a time
+        if let Some(op_id) = me.write_op_id.take() {
+            return match executor::get_result(op_id) {
+                Some(res) => {
+                    trace!("Got result {res}");
+                    if res < 0 {
+                        Poll::Ready(Err(std::io::Error::from_raw_os_error(res)))
+                    } else {
+                        Poll::Ready(Ok(res as usize))
+                    }
+                },
+                None => {
+                    Poll::Pending
+                }
+            };
+        }
+
+        let op_id = executor::get_next_op_id();
+        me.write_op_id = Some(op_id);
+        let ptr = buf.as_ptr();
+        let capacity = buf.len() as u32;
+        let op = opcode::Send::new(types::Fd(me.fd), ptr, capacity);
+        executor::schedule_completion(op_id, false);
+        uring::submit(op.build().user_data(op_id)).expect("submit asyncwrite");
+
+        Poll::Pending
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), futures::io::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), futures::io::Error>> {
+        let mut me = self.as_mut();
+
+        // Only allow one read queued on a TcpStream at a time
+        if let Some(op_id) = me.close_op_id.take() {
+            return match executor::get_result(op_id) {
+                Some(res) => {
+                    trace!("Got result {res}");
+                    if res < 0 {
+                        Poll::Ready(Err(std::io::Error::from_raw_os_error(res)))
+                    } else {
+                        Poll::Ready(Ok(()))
+                    }
+                },
+                None => {
+                    Poll::Pending
+                }
+            };
+        }
+
+        let op_id = executor::get_next_op_id();
+        me.write_op_id = Some(op_id);
+        let op = opcode::Close::new(types::Fd(me.fd));
+        executor::schedule_completion(op_id, false);
+        uring::submit(op.build().user_data(op_id)).expect("submit close");
+
+        Poll::Pending
     }
 }

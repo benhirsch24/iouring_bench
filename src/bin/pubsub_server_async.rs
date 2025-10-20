@@ -1,6 +1,8 @@
 use clap::{Parser};
 use log::{error, info, trace, warn};
 
+use futures::io::{AsyncReadExt, AsyncWriteExt};
+
 use iouring_bench::executor;
 use iouring_bench::uring;
 use iouring_bench::net as unet;
@@ -37,11 +39,28 @@ fn main() -> anyhow::Result<()> {
         let mut listener = unet::TcpListener::bind("0.0.0.0:8080").unwrap();
         loop {
             let task_id = executor::get_task_id();
-            info!("Accepting {task_id}");
-            let stream = listener.accept_multi_fut().await.unwrap();
+            info!("Accepting");
+            let mut stream = listener.accept_multi_fut().await.unwrap();
             executor::spawn(Box::pin(async move {
                 let task_id = executor::get_task_id();
                 info!("Got stream {} for {task_id}", stream.as_raw_fd());
+                loop {
+                    let mut buf = [0u8; 1024];
+                    let n = stream.read(&mut buf).await.expect("Read buf");
+                    info!("Read {n} from stream");
+                    if n == 0 {
+                        info!("Stream done");
+                        return;
+                    }
+
+                    let response = "hello to you too\r\n";
+                    let mut written = 0;
+                    while written < response.len() {
+                        let n = stream.write(response.as_bytes()).await.expect("Write");
+                        written += n;
+                        info!("Wrote {n}");
+                    }
+                }
             }));
         }
         ()
