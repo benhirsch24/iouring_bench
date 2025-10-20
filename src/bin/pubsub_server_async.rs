@@ -1,7 +1,10 @@
 use clap::{Parser};
-use log::info;
+use futures::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use log::{error, info};
 
-use futures::io::{AsyncReadExt, AsyncWriteExt};
+use std::collections::{HashMap};
+use std::{cell::RefCell, rc::Rc};
+use std::os::fd::RawFd;
 
 use iouring_bench::executor;
 use iouring_bench::uring;
@@ -22,6 +25,67 @@ struct Args {
     /// Interval for kernel submission queue polling. If 0 then sqpoll is disabled. Default 0.
     #[arg(short = 'i', long, default_value_t = 0)]
     sqpoll_interval_ms: u32,
+}
+
+async fn handle_publisher(mut reader: BufReader<unet::TcpStream>, mut writer: unet::TcpStream, channel: String, submap: Rc<RefCell<HashMap<String, HashMap<RawFd, unet::TcpStream>>>>) {
+    info!("Handling publisher");
+    let ok = b"OK\r\n";
+    writer.write_all(ok).await.expect("OK");
+
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line).await {
+            Ok(n) => {
+                if n == 0 {
+                    info!("Publisher left");
+                    return;
+                }
+                info!("Got message {line}");
+                if let Some(set) = submap.borrow_mut().get_mut(&channel) {
+                    for (_, s) in set.iter_mut() {
+                        s.write_all(line.as_bytes()).await.expect("Write line");
+                    }
+                }
+            },
+            Err(e) => {
+                error!("Got error {e}");
+                return;
+            },
+        }
+    }
+}
+
+async fn handle_subscriber(mut reader: BufReader<unet::TcpStream>, mut writer: unet::TcpStream, channel: String, submap: Rc<RefCell<HashMap<String, HashMap<RawFd, unet::TcpStream>>>>) {
+    info!("Handling subscriber");
+    let ok = b"OK\r\n";
+    writer.write_all(ok).await.expect("OK");
+
+    let new_stream_fd = writer.as_raw_fd();
+    let new_stream = unet::TcpStream::new(writer.as_raw_fd());
+    let _ = submap.borrow_mut().entry(channel.clone()).or_insert(HashMap::new()).insert(new_stream_fd, new_stream);
+
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line).await {
+            Ok(n) => {
+                if n == 0 {
+                    info!("Subscriber left");
+                    let _ = submap.borrow_mut().get_mut(&channel).unwrap().remove(&new_stream_fd);
+                    return;
+                }
+                info!("Got message {line}");
+            },
+            Err(e) => {
+                error!("Got error {e}");
+                return;
+            },
+        }
+    }
+}
+
+fn parse_channel(s: &String, start: usize) -> String {
+    let s = s.trim();
+    s[start..].to_string()
 }
 
 fn main() -> anyhow::Result<()> {
@@ -47,28 +111,34 @@ fn main() -> anyhow::Result<()> {
 
     executor::spawn(async {
         let mut listener = unet::TcpListener::bind("0.0.0.0:8080").unwrap();
+        let submap = Rc::new(RefCell::new(HashMap::new()));
         loop {
             info!("Accepting");
-            let mut stream = listener.accept_multi_fut().unwrap().await.unwrap();
+            let stream = listener.accept_multi_fut().unwrap().await.unwrap();
+            let submap = submap.clone();
             executor::spawn(async move {
                 info!("Got stream {}", stream.as_raw_fd());
-                loop {
-                    let mut buf = [0u8; 1024];
-                    let n = stream.read(&mut buf).await.expect("Read buf");
-                    info!("Read {n} from stream");
-                    if n == 0 {
-                        info!("Stream done");
-                        return;
-                    }
-
-                    let response = "hello to you too\r\n";
-                    let mut written = 0;
-                    while written < response.len() {
-                        let n = stream.write(response.as_bytes()).await.expect("Write");
-                        written += n;
-                        info!("Wrote {n}");
-                    }
+                // TODO: idk, it's weird that I'm cloning the TcpStream. I could technically create
+                // a second read against it but that would be bad...
+                // Be careful!
+                let fd = stream.as_raw_fd();
+                let writer = unet::TcpStream::new(fd);
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.expect("line");
+                if line.starts_with("PUBLISH") {
+                    let channel = parse_channel(&line, 8);
+                    handle_publisher(reader, writer, channel, submap).await;
+                } else if line.starts_with("SUBSCRIBE") {
+                    let channel = parse_channel(&line, 10);
+                    handle_subscriber(reader, writer, channel, submap).await;
+                } else {
+                    error!("uh oh don't know you");
                 }
+                // TODO: Again, weird that I'm re-creating the tcp stream to close it but oh
+                // wellsies
+                let mut stream = unet::TcpStream::new(fd);
+                stream.close().await.expect("Stream closing");
             });
         }
         ()
