@@ -2,6 +2,7 @@ use futures::{AsyncRead, AsyncWrite};
 use io_uring::{opcode, types};
 use log::trace;
 
+use std::io::Error;
 use std::net::ToSocketAddrs;
 use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
@@ -35,9 +36,9 @@ impl TcpListener {
         Ok(uring::submit(op.build().user_data(ud))?)
     }
 
-    pub fn accept_multi_fut(&mut self) -> AcceptFuture {
+    pub fn accept_multi_fut(&mut self) -> std::io::Result<AcceptFuture> {
         if let Some(op_id) = self.accept_multi_op.as_ref() {
-            return AcceptFuture { op_id: *op_id };
+            return Ok(AcceptFuture { op_id: *op_id });
         }
 
         let fd = self.l.as_raw_fd();
@@ -45,9 +46,12 @@ impl TcpListener {
         let op_id = executor::get_next_op_id();
         self.accept_multi_op = Some(op_id);
         executor::schedule_completion(op_id, true);
-        uring::submit(opcode.build().user_data(op_id));
-        AcceptFuture {
-            op_id,
+        if let Err(e) = uring::submit(opcode.build().user_data(op_id)) {
+            Err(Error::new(std::io::ErrorKind::Other, format!("Uring problem: {e}")))
+        } else {
+            Ok(AcceptFuture {
+                op_id,
+            })
         }
     }
 }
@@ -59,7 +63,7 @@ pub struct AcceptFuture {
 impl Future for AcceptFuture {
     type Output = std::io::Result<TcpStream>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.as_ref();
         match executor::get_result(me.op_id) {
             Some(res) => {
@@ -112,7 +116,7 @@ impl TcpStream {
 }
 
 impl AsyncRead for TcpStream {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, futures::io::Error>> {
+    fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, futures::io::Error>> {
         let mut me = self.as_mut();
 
         // Only allow one read queued on a TcpStream at a time
@@ -145,7 +149,7 @@ impl AsyncRead for TcpStream {
 }
 
 impl AsyncWrite for TcpStream {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, futures::io::Error>> {
+    fn poll_write(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, futures::io::Error>> {
         let mut me = self.as_mut();
 
         // Only allow one read queued on a TcpStream at a time
@@ -171,16 +175,18 @@ impl AsyncWrite for TcpStream {
         let capacity = buf.len() as u32;
         let op = opcode::Send::new(types::Fd(me.fd), ptr, capacity);
         executor::schedule_completion(op_id, false);
-        uring::submit(op.build().user_data(op_id)).expect("submit asyncwrite");
-
-        Poll::Pending
+        if let Err(e) = uring::submit(op.build().user_data(op_id)) {
+            Poll::Ready(Err(Error::new(std::io::ErrorKind::Other, format!("Uring problem: {e}"))))
+        } else {
+            Poll::Pending
+        }
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), futures::io::Error>> {
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), futures::io::Error>> {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), futures::io::Error>> {
+    fn poll_close(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), futures::io::Error>> {
         let mut me = self.as_mut();
 
         // Only allow one read queued on a TcpStream at a time

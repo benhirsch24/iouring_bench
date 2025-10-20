@@ -1,5 +1,5 @@
 use clap::{Parser};
-use log::{error, info, trace, warn};
+use log::info;
 
 use futures::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -38,12 +38,10 @@ fn main() -> anyhow::Result<()> {
     executor::spawn(Box::pin(async {
         let mut listener = unet::TcpListener::bind("0.0.0.0:8080").unwrap();
         loop {
-            let task_id = executor::get_task_id();
             info!("Accepting");
-            let mut stream = listener.accept_multi_fut().await.unwrap();
+            let mut stream = listener.accept_multi_fut().unwrap().await.unwrap();
             executor::spawn(Box::pin(async move {
-                let task_id = executor::get_task_id();
-                info!("Got stream {} for {task_id}", stream.as_raw_fd());
+                info!("Got stream {}", stream.as_raw_fd());
                 loop {
                     let mut buf = [0u8; 1024];
                     let n = stream.read(&mut buf).await.expect("Read buf");

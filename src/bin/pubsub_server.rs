@@ -122,7 +122,7 @@ fn main() -> anyhow::Result<()> {
     listener.accept(move |fd| {
         let stream = unet::TcpStream::new(fd);
         println!("Accepted");
-        let mut protocol = BytesMut::with_capacity(1024);
+        let protocol = BytesMut::with_capacity(1024);
         //stream.recv(protocol.as_mut_ptr(), protocol.capacity(), move |res| {
         //    do_protocol(stream, protocol, res)
         //})?;

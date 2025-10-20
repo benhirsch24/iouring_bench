@@ -6,7 +6,7 @@ use std::task::{Context, Poll, Waker};
 
 use crate::uring;
 
-use log::{info, trace};
+use log::trace;
 
 struct ExecutorInner {
     results: HashMap<u64, i32>,
@@ -41,7 +41,7 @@ impl ExecutorInner {
         }
     }
 
-    fn handle_completion(&mut self, op: u64, res: i32, flags: u32) -> Result<(), anyhow::Error> {
+    fn handle_completion(&mut self, op: u64, res: i32, _flags: u32) -> Result<(), anyhow::Error> {
         if !self.op_to_task.contains_key(&op) {
             trace!("No op to task {op}");
             anyhow::bail!("No completion {op}");
@@ -201,7 +201,7 @@ struct Executor {
 impl Executor {
     pub fn new() -> Self {
         // If uring was already initialized this will be a no-op
-        uring::init(uring::UringArgs::default());
+        uring::init(uring::UringArgs::default()).expect("uring init!");
         Self {
             inner: Rc::new(UnsafeCell::new(ExecutorInner::new())),
         }
@@ -209,35 +209,35 @@ impl Executor {
 
     fn handle_completion(&mut self, op: u64, res: i32, flags: u32) -> Result<(), anyhow::Error> {
         unsafe {
-            let mut inner = &mut *self.inner.get();
+            let inner = &mut *self.inner.get();
             inner.handle_completion(op, res, flags)
         }
     }
 
     fn spawn(&mut self, fut: Pin<Box<dyn Future<Output = ()>>>) {
         unsafe {
-            let mut inner = &mut *self.inner.get();
+            let inner = &mut *self.inner.get();
             inner.spawn(fut);
         }
     }
 
     fn schedule_completion(&mut self, op: u64, is_multi: bool) {
         unsafe {
-            let mut inner = &mut *self.inner.get();
+            let inner = &mut *self.inner.get();
             inner.schedule_completion(op, is_multi);
         }
     }
 
     fn get_result(&self, op: u64) -> Option<i32> {
         unsafe {
-            let mut inner = &mut *self.inner.get();
+            let inner = &mut *self.inner.get();
             inner.get_result(op)
         }
     }
 
     pub fn run(&mut self) {
         unsafe {
-            let mut inner = &mut *self.inner.get();
+            let inner = &mut *self.inner.get();
             inner.run()
         }
     }
@@ -246,7 +246,7 @@ impl Executor {
 mod tests {
     use std::future::Future;
     use std::pin::Pin;
-    use std::task::{Context, Poll, Waker};
+    use std::task::{Context, Poll};
     use super::Executor;
 
     struct ExampleFuture {
