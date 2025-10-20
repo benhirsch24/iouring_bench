@@ -68,7 +68,11 @@ impl Future for AcceptFuture {
         match executor::get_result(me.op_id) {
             Some(res) => {
                 trace!("Got result {res}");
-                Poll::Ready(Ok(TcpStream::new(res.into())))
+                if res < 0 {
+                    Poll::Ready(Err(std::io::Error::from_raw_os_error(-res)))
+                } else {
+                    Poll::Ready(Ok(TcpStream::new(res.into())))
+                }
             },
             None => {
                 Poll::Pending
@@ -125,7 +129,7 @@ impl AsyncRead for TcpStream {
                 Some(res) => {
                     trace!("Got result {res}");
                     if res < 0 {
-                        Poll::Ready(Err(std::io::Error::from_raw_os_error(res)))
+                        Poll::Ready(Err(std::io::Error::from_raw_os_error(-res)))
                     } else {
                         Poll::Ready(Ok(res as usize))
                     }
@@ -158,7 +162,7 @@ impl AsyncWrite for TcpStream {
                 Some(res) => {
                     trace!("Got result {res}");
                     if res < 0 {
-                        Poll::Ready(Err(std::io::Error::from_raw_os_error(res)))
+                        Poll::Ready(Err(std::io::Error::from_raw_os_error(-res)))
                     } else {
                         Poll::Ready(Ok(res as usize))
                     }
@@ -195,7 +199,7 @@ impl AsyncWrite for TcpStream {
                 Some(res) => {
                     trace!("Got result {res}");
                     if res < 0 {
-                        Poll::Ready(Err(std::io::Error::from_raw_os_error(res)))
+                        Poll::Ready(Err(std::io::Error::from_raw_os_error(-res)))
                     } else {
                         Poll::Ready(Ok(()))
                     }

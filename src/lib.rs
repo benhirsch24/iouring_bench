@@ -3,5 +3,6 @@ pub mod connection;
 pub mod executor;
 pub mod net;
 pub mod pubsub;
+pub mod timeout;
 pub mod uring;
 pub mod user_data;

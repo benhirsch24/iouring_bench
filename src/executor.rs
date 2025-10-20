@@ -14,7 +14,10 @@ struct ExecutorInner {
     op_to_task: HashMap<u64, (u64, bool)>,
     next_task_id: u64,
     next_op_id: u64,
-    ready_queue: Vec<u64>, // list of tasks ready to be polled
+    ready_queue: Vec<u64>,
+
+    timer_id: u64,
+    timers: HashMap<u64, io_uring::types::Timespec>,
 }
 
 thread_local! {
@@ -38,7 +41,20 @@ impl ExecutorInner {
             next_task_id: 0,
             next_op_id: 0,
             ready_queue: Vec::new(),
+            timer_id: 0,
+            timers: HashMap::new(),
         }
+    }
+
+    fn register_timer(&mut self, ts: io_uring::types::Timespec) -> (u64, *const io_uring::types::Timespec) {
+        let id = self.timer_id;
+        self.timer_id += 1;
+        self.timers.insert(id, ts);
+        (id, self.timers.get(&id).unwrap() as *const io_uring::types::Timespec)
+    }
+
+    pub fn unregister_timer(&mut self, timer_id: u64) {
+        self.timers.remove(&timer_id);
     }
 
     fn handle_completion(&mut self, op: u64, res: i32, _flags: u32) -> Result<(), anyhow::Error> {
@@ -100,9 +116,9 @@ impl ExecutorInner {
         self.results.remove(&op)
     }
 
-    fn spawn(&mut self, fut: Pin<Box<dyn Future<Output = ()>>>) {
+    fn spawn(&mut self, fut: impl Future<Output = ()> + 'static) {
         let task_id = self.get_next_task_id();
-        self.tasks.insert(task_id, fut);
+        self.tasks.insert(task_id, Box::pin(fut));
         self.ready_queue.push(task_id);
     }
 
@@ -130,11 +146,29 @@ pub fn init() {
     })
 }
 
-pub fn spawn(fut: Pin<Box<dyn Future<Output = ()>>>) {
+pub fn spawn(fut: impl Future<Output = ()> + 'static) {
     EXECUTOR.with(|exe| {
         unsafe {
             let exe = &mut *exe.get();
-            exe.as_mut().unwrap().spawn(fut);
+            exe.as_mut().unwrap().spawn(Box::pin(fut));
+        }
+    })
+}
+
+pub fn register_timer(ts: io_uring::types::Timespec) -> (u64, *const io_uring::types::Timespec) {
+    EXECUTOR.with(|exe| {
+        unsafe {
+            let exe = &mut *exe.get();
+            exe.as_mut().unwrap().register_timer(ts)
+        }
+    })
+}
+
+pub fn unregister_timer(timer_id: u64) {
+    EXECUTOR.with(|exe| {
+        unsafe {
+            let exe = &mut *exe.get();
+            exe.as_mut().unwrap().unregister_timer(timer_id)
         }
     })
 }
@@ -214,10 +248,10 @@ impl Executor {
         }
     }
 
-    fn spawn(&mut self, fut: Pin<Box<dyn Future<Output = ()>>>) {
+    fn spawn(&mut self, fut: impl Future<Output = ()> + 'static) {
         unsafe {
             let inner = &mut *self.inner.get();
-            inner.spawn(fut);
+            inner.spawn(Box::pin(fut));
         }
     }
 
@@ -277,7 +311,7 @@ mod tests {
         let mut executor = Executor::new();
         let task_id = 1;
         let res = Rc::new(RefCell::new(false));
-        let f = Box::pin({
+        let f = {
             let mut executor = executor.clone();
             let task_id = task_id;
             let res = res.clone();
@@ -289,7 +323,7 @@ mod tests {
                 *res.borrow_mut() = true;
                 ()
             }
-        });
+        };
         let id: u64 = 5;
         executor.spawn(task_id, f);
         executor.schedule_completion(id);

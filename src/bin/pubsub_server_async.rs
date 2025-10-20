@@ -6,6 +6,7 @@ use futures::io::{AsyncReadExt, AsyncWriteExt};
 use iouring_bench::executor;
 use iouring_bench::uring;
 use iouring_bench::net as unet;
+use iouring_bench::timeout::TimeoutFuture as Timeout;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -35,12 +36,21 @@ fn main() -> anyhow::Result<()> {
 
     executor::init();
 
-    executor::spawn(Box::pin(async {
+    executor::spawn(async {
+        let mut timeout = Timeout::from_secs(5, true);
+        loop {
+            timeout = timeout.await.expect("REASON");
+            let stats = uring::stats().expect("stats");
+            info!("Metrics: {}", stats);
+        }
+    });
+
+    executor::spawn(async {
         let mut listener = unet::TcpListener::bind("0.0.0.0:8080").unwrap();
         loop {
             info!("Accepting");
             let mut stream = listener.accept_multi_fut().unwrap().await.unwrap();
-            executor::spawn(Box::pin(async move {
+            executor::spawn(async move {
                 info!("Got stream {}", stream.as_raw_fd());
                 loop {
                     let mut buf = [0u8; 1024];
@@ -59,10 +69,10 @@ fn main() -> anyhow::Result<()> {
                         info!("Wrote {n}");
                     }
                 }
-            }));
+            });
         }
         ()
-    }));
+    });
 
     executor::run();
 
