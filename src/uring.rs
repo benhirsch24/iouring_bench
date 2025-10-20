@@ -82,15 +82,16 @@ pub fn init(args: UringArgs) -> Result<(), std::io::Error> {
     })
 }
 
-pub fn run<H>(handler: H) -> Result<(), anyhow::Error>
+pub fn run<H, F>(handler: H, done: F) -> Result<(), anyhow::Error>
     where
         H: FnMut(u64, i32, u32) -> Result<(), anyhow::Error>,
+        F: Fn()
 {
     URING.with(|uring| {
         unsafe {
             let uring_ref = &mut *uring.get();
             let uring_mut = uring_ref.as_mut().unwrap();
-            uring_mut.run(handler)
+            uring_mut.run(handler, done)
         }
     })?;
     Ok(())
@@ -159,9 +160,10 @@ impl Uring {
         self.done = true;
     }
 
-    fn run<H>(&mut self, mut handler: H) -> Result<(), anyhow::Error>
+    fn run<H, F>(&mut self, mut completion_handler: H, completions_done_handler: F) -> Result<(), anyhow::Error>
     where
         H: FnMut(u64, i32, u32) -> Result<(), anyhow::Error>,
+        F: Fn(),
     {
         loop {
             if self.done {
@@ -176,10 +178,11 @@ impl Uring {
                 self.stats.completions_last_period += 1;
                 completed += 1;
                 trace!("completion result={} ud={}", e.result(), e.user_data());
-                if let Err(err) = handler(e.user_data(), e.result(), e.flags()) {
+                if let Err(err) = completion_handler(e.user_data(), e.result(), e.flags()) {
                     error!("Error handling cqe (ud={} res={}): {err}", e.user_data(), e.result());
                 }
             }
+            completions_done_handler();
 
             // Submit N batches of size threshold
             let num_batches = self.to_submit.len() / self.args.submissions_threshold;

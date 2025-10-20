@@ -1,4 +1,4 @@
-use std::{cell::{RefCell, UnsafeCell}, rc::Rc};
+use std::{cell::{Cell, UnsafeCell}, rc::Rc};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -6,14 +6,27 @@ use std::task::{Context, Poll, Waker};
 
 use crate::uring;
 
-use log::info;
+use log::{info, trace};
 
 struct ExecutorInner {
     results: HashMap<u64, i32>,
     tasks: HashMap<u64, Pin<Box<dyn Future<Output = ()>>>>,
-    op_to_task: HashMap<u64, u64>,
+    op_to_task: HashMap<u64, (u64, bool)>,
     next_task_id: u64,
     next_op_id: u64,
+    ready_queue: Vec<u64>, // list of tasks ready to be polled
+}
+
+thread_local! {
+    static THREAD_ID: Cell<u64> = Cell::new(0);
+}
+
+pub fn get_task_id() -> u64 {
+    THREAD_ID.get()
+}
+
+fn set_task_id(new_task_id: u64) {
+    THREAD_ID.set(new_task_id)
 }
 
 impl ExecutorInner {
@@ -24,47 +37,51 @@ impl ExecutorInner {
             op_to_task: HashMap::new(),
             next_task_id: 0,
             next_op_id: 0,
+            ready_queue: Vec::new(),
         }
     }
 
     fn handle_completion(&mut self, op: u64, res: i32, flags: u32) -> Result<(), anyhow::Error> {
         if !self.op_to_task.contains_key(&op) {
+            trace!("No op to task {op}");
             anyhow::bail!("No completion {op}");
         }
 
-        let task_id  = self.op_to_task.get(&op).copied().unwrap();
+        let (task_id, is_multi)  = self.op_to_task.get(&op).copied().unwrap();
+        self.ready_queue.push(task_id);
         self.results.insert(op, res);
-        if self.tasks.contains_key(&task_id) {
-            let mut task = self.tasks.remove(&task_id).expect("We just verified");
-            let mut ctx = Context::from_waker(Waker::noop());
-            match task.as_mut().poll(&mut ctx) {
-                Poll::Ready(_) => {
-                    info!("Task complete");
-                    self.results.remove(&op);
-                },
-                Poll::Pending => {
-                    self.tasks.insert(task_id, Box::pin(task));
-                },
-            }
+        trace!("Got task {task_id} for {op}");
+        if !is_multi {
+            self.op_to_task.remove(&op);
         }
         Ok(())
     }
 
-    pub fn run(&mut self) {
-        // Handle task0 first
-        // TODO: I probably do need to evolve this into:
-        // 1. Handle all completions (push ready tasks to ready queue)
-        // 2. Poll ready tasks
-        //
-        // That way I can spawn arbitrary tasks eg timeouts which can be polled after the next
-        // completion queue run. But I'll defer that for a little bit
-        // This block below polls the first task
-        let op = self.get_next_op_id();
-        self.schedule_completion(0, op);
-        self.handle_completion(0, 0, 0);
+    fn handle_ready_queue(&mut self) {
+        trace!("Ready queue len {}", self.ready_queue.len());
+        for task_id in self.ready_queue.drain(..) {
+            set_task_id(task_id);
+            if let Some(mut task) = self.tasks.remove(&task_id) {
+                let mut ctx = Context::from_waker(Waker::noop());
+                match task.as_mut().poll(&mut ctx) {
+                    Poll::Ready(_) => {
+                        trace!("Task {task_id} complete");
+                    },
+                    Poll::Pending => {
+                        trace!("Task still pending {task_id}");
+                        self.tasks.insert(task_id, Box::pin(task));
+                    },
+                }
+            }
+        }
+    }
 
+    pub fn run(&mut self) {
         // Run the main uring loop using our callback
-        uring::run(|op, res, flags| self.handle_completion(op, res, flags)).expect("running uring");
+        uring::run(
+            |op, res, flags| handle_completion(op, res, flags),
+            || { handle_ready_queue() },
+        ).expect("running uring");
     }
 
     fn get_next_op_id(&mut self) -> u64 {
@@ -79,16 +96,19 @@ impl ExecutorInner {
         task
     }
 
-    fn get_result(&self, op: u64) -> Option<i32> {
-        self.results.get(&op).copied()
+    fn get_result(&mut self, op: u64) -> Option<i32> {
+        self.results.remove(&op)
     }
 
-    fn schedule(&mut self, task_id: u64, fut: Pin<Box<dyn Future<Output = ()>>>) {
+    fn spawn(&mut self, fut: Pin<Box<dyn Future<Output = ()>>>) {
+        let task_id = self.get_next_task_id();
         self.tasks.insert(task_id, fut);
+        self.ready_queue.push(task_id);
     }
 
-    fn schedule_completion(&mut self, task_id: u64, op: u64) {
-        self.op_to_task.insert(op, task_id);
+    fn schedule_completion(&mut self, op: u64, is_multi: bool) {
+        let task_id = get_task_id();
+        self.op_to_task.insert(op, (task_id, is_multi));
     }
 }
 
@@ -110,11 +130,29 @@ pub fn init() {
     })
 }
 
-pub fn schedule(task_id: u64, fut: Pin<Box<dyn Future<Output = ()>>>) {
+pub fn spawn(fut: Pin<Box<dyn Future<Output = ()>>>) {
     EXECUTOR.with(|exe| {
         unsafe {
             let exe = &mut *exe.get();
-            exe.as_mut().unwrap().schedule(task_id, fut);
+            exe.as_mut().unwrap().spawn(fut);
+        }
+    })
+}
+
+pub fn handle_completion(op: u64, res: i32, flags: u32) -> Result<(), anyhow::Error> {
+    EXECUTOR.with(|exe| {
+        unsafe {
+            let exe = &mut *exe.get();
+            exe.as_mut().unwrap().handle_completion(op, res, flags)
+        }
+    })
+}
+
+pub fn handle_ready_queue() {
+    EXECUTOR.with(|exe| {
+        unsafe {
+            let exe = &mut *exe.get();
+            exe.as_mut().unwrap().handle_ready_queue()
         }
     })
 }
@@ -128,15 +166,6 @@ pub fn get_next_op_id() -> u64 {
     })
 }
 
-pub fn get_next_task_id() -> u64 {
-    EXECUTOR.with(|exe| {
-        unsafe {
-            let exe = &mut *exe.get();
-            exe.as_mut().unwrap().get_next_task_id()
-        }
-    })
-}
-
 pub fn get_result(op_id: u64) -> Option<i32> {
     EXECUTOR.with(|exe| {
         unsafe {
@@ -146,11 +175,11 @@ pub fn get_result(op_id: u64) -> Option<i32> {
     })
 }
 
-pub fn schedule_completion(task_id: u64, op_id: u64) {
+pub fn schedule_completion(op_id: u64, is_multi: bool) {
     EXECUTOR.with(|exe| {
         unsafe {
             let exe = &mut *exe.get();
-            exe.as_mut().unwrap().schedule_completion(task_id, op_id)
+            exe.as_mut().unwrap().schedule_completion(op_id, is_multi)
         }
     })
 }
@@ -185,17 +214,17 @@ impl Executor {
         }
     }
 
-    fn schedule(&mut self, op: u64, fut: Pin<Box<dyn Future<Output = ()>>>) {
+    fn spawn(&mut self, fut: Pin<Box<dyn Future<Output = ()>>>) {
         unsafe {
             let mut inner = &mut *self.inner.get();
-            inner.schedule(op, fut);
+            inner.spawn(fut);
         }
     }
 
-    fn schedule_completion(&mut self, task_id: u64, op: u64) {
+    fn schedule_completion(&mut self, op: u64, is_multi: bool) {
         unsafe {
             let mut inner = &mut *self.inner.get();
-            inner.schedule_completion(task_id, op);
+            inner.schedule_completion(op, is_multi);
         }
     }
 
@@ -218,7 +247,6 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::task::{Context, Poll, Waker};
-    use std::{cell::RefCell, rc::Rc};
     use super::Executor;
 
     struct ExampleFuture {
@@ -256,15 +284,15 @@ mod tests {
             async move {
                 let example_future_op = 7;
                 let fut = Box::pin(ExampleFuture { id: example_future_op, executor: executor.clone() });
-                executor.schedule_completion(task_id, example_future_op);
+                executor.schedule_completion(example_future_op);
                 fut.await;
                 *res.borrow_mut() = true;
                 ()
             }
         });
         let id: u64 = 5;
-        executor.schedule(task_id, f);
-        executor.schedule_completion(task_id, id);
+        executor.spawn(task_id, f);
+        executor.schedule_completion(id);
         executor.handle_completion(5, 0, 0).expect("No error");
         if let Ok(_) = executor.handle_completion(6, 0, 0) {
             panic!("No scheduled completion 6");

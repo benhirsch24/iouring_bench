@@ -1,12 +1,10 @@
 use io_uring::{opcode, types};
+use log::trace;
 
 use std::net::ToSocketAddrs;
 use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
-use std::task::{Context, Poll, Waker};
-use std::{cell::RefCell, rc::Rc};
-
-use futures::{AsyncRead, io::{Error}};
+use std::task::{Context, Poll};
 
 use crate::uring;
 use crate::callbacks::add_callback;
@@ -14,6 +12,7 @@ use crate::executor;
 
 pub struct TcpListener {
     l: std::net::TcpListener,
+    accept_multi_op: Option<u64>,
 }
 
 impl TcpListener {
@@ -21,6 +20,7 @@ impl TcpListener {
         let l = std::net::TcpListener::bind(addr)?;
         Ok(TcpListener{
             l,
+            accept_multi_op: None,
         })
     }
 
@@ -34,14 +34,16 @@ impl TcpListener {
         Ok(uring::submit(op.build().user_data(ud))?)
     }
 
-    pub fn accept_fut(&self) -> AcceptFuture {
-        // TODO: Add persistent op id
-        let op_id = executor::get_next_op_id();
+    pub fn accept_multi_fut(&mut self) -> AcceptFuture {
+        if let Some(op_id) = self.accept_multi_op.as_ref() {
+            return AcceptFuture { op_id: *op_id };
+        }
+
         let fd = self.l.as_raw_fd();
-        // TODO: Get current task
-        let task_id = 0;
         let opcode = opcode::AcceptMulti::new(types::Fd(fd));
-        executor::schedule_completion(task_id, op_id);
+        let op_id = executor::get_next_op_id();
+        self.accept_multi_op = Some(op_id);
+        executor::schedule_completion(op_id, true);
         uring::submit(opcode.build().user_data(op_id));
         AcceptFuture {
             op_id,
@@ -60,7 +62,7 @@ impl Future for AcceptFuture {
         let me = self.as_ref();
         match executor::get_result(me.op_id) {
             Some(res) => {
-                println!("Got result {res}");
+                trace!("Got result {res}");
                 Poll::Ready(Ok(TcpStream::new(res.into())))
             },
             None => {
