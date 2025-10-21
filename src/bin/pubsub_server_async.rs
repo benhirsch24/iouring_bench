@@ -1,6 +1,6 @@
 use clap::{Parser};
 use futures::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use log::{error, info};
+use log::{error, debug, info, warn};
 
 use std::collections::{HashMap};
 use std::{cell::RefCell, rc::Rc};
@@ -40,7 +40,7 @@ async fn handle_publisher(mut reader: BufReader<unet::TcpStream>, mut writer: un
                     info!("Publisher left");
                     return;
                 }
-                info!("Got message {line}");
+                debug!("Got message {line}");
                 if let Some(set) = submap.borrow_mut().get_mut(&channel) {
                     for (_, s) in set.iter_mut() {
                         s.write_all(line.as_bytes()).await.expect("Write line");
@@ -73,7 +73,7 @@ async fn handle_subscriber(mut reader: BufReader<unet::TcpStream>, mut writer: u
                     let _ = submap.borrow_mut().get_mut(&channel).unwrap().remove(&new_stream_fd);
                     return;
                 }
-                info!("Got message {line}");
+                debug!("Got message {line}");
             },
             Err(e) => {
                 error!("Got error {e}");
@@ -117,7 +117,8 @@ fn main() -> anyhow::Result<()> {
             let stream = listener.accept_multi_fut().unwrap().await.unwrap();
             let submap = submap.clone();
             executor::spawn(async move {
-                info!("Got stream {}", stream.as_raw_fd());
+                let task_id = executor::get_task_id();
+                info!("Got stream task_id={task_id} fd={}", stream.as_raw_fd());
                 // TODO: idk, it's weird that I'm cloning the TcpStream. I could technically create
                 // a second read against it but that would be bad...
                 // Be careful!
@@ -125,7 +126,12 @@ fn main() -> anyhow::Result<()> {
                 let writer = unet::TcpStream::new(fd);
                 let mut reader = BufReader::new(stream);
                 let mut line = String::new();
-                reader.read_line(&mut line).await.expect("line");
+                if let Err(e) = reader.read_line(&mut line).await {
+                    error!("Failed to read line: {e}");
+                    let mut stream = unet::TcpStream::new(fd);
+                    stream.close().await.expect("Stream closing");
+                    return;
+                }
                 if line.starts_with("PUBLISH") {
                     let channel = parse_channel(&line, 8);
                     handle_publisher(reader, writer, channel, submap).await;
@@ -133,12 +139,15 @@ fn main() -> anyhow::Result<()> {
                     let channel = parse_channel(&line, 10);
                     handle_subscriber(reader, writer, channel, submap).await;
                 } else {
-                    error!("uh oh don't know you");
+                    warn!("Line had length {} but didn't start with expected protocol", line.len());
                 }
                 // TODO: Again, weird that I'm re-creating the tcp stream to close it but oh
                 // wellsies
                 let mut stream = unet::TcpStream::new(fd);
-                stream.close().await.expect("Stream closing");
+                if let Err(e) = stream.close().await {
+                    warn!("Failed to close fd={}: {e}", stream.as_raw_fd());
+                }
+                info!("Exiting task_id={task_id} fd={}", stream.as_raw_fd());
             });
         }
         ()

@@ -1,10 +1,11 @@
 use futures::{AsyncRead, AsyncWrite};
 use io_uring::{opcode, types};
-use log::trace;
+use log::{info, trace};
+use socket2::{Socket, Domain, Type};
 
 use std::io::Error;
 use std::net::ToSocketAddrs;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -31,7 +32,6 @@ impl TcpListener {
     {
         let fd = self.l.as_raw_fd();
         let op = opcode::AcceptMulti::new(types::Fd(fd));
-        // TODO: Add callback that won't be removed
         let ud = add_callback(f);
         Ok(uring::submit(op.build().user_data(ud))?)
     }
@@ -46,6 +46,7 @@ impl TcpListener {
         let op_id = executor::get_next_op_id();
         self.accept_multi_op = Some(op_id);
         executor::schedule_completion(op_id, true);
+        trace!("Scheduling accept completion for op={op_id} fd={} task_id={}", fd, executor::get_task_id());
         if let Err(e) = uring::submit(opcode.build().user_data(op_id)) {
             Err(Error::new(std::io::ErrorKind::Other, format!("Uring problem: {e}")))
         } else {
@@ -81,6 +82,34 @@ impl Future for AcceptFuture {
     }
 }
 
+pub struct ConnectFuture {
+    op_id: u64,
+    addr: Box<os_socketaddr::OsSocketAddr>,
+    fd: RawFd,
+}
+
+impl Future for ConnectFuture {
+    type Output = std::io::Result<TcpStream>;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let me = self.as_ref();
+        match executor::get_result(me.op_id) {
+            Some(res) => {
+                trace!("Got result {res}");
+                if res < 0 {
+                    Poll::Ready(Err(std::io::Error::from_raw_os_error(-res)))
+                } else {
+                    Poll::Ready(Ok(TcpStream::new(me.fd)))
+                }
+            },
+            None => {
+                trace!("Connect pending");
+                Poll::Pending
+            }
+        }
+    }
+}
+
 pub struct TcpStream {
     fd: RawFd,
     read_op_id: Option<u64>,
@@ -100,6 +129,25 @@ impl TcpStream {
 
     pub fn as_raw_fd(&self) -> RawFd {
         self.fd
+    }
+
+    pub fn connect<A: ToSocketAddrs>(addr: A) -> ConnectFuture {
+        let op_id = executor::get_next_op_id();
+
+        let socket_addr = addr.to_socket_addrs().ok().unwrap().next().unwrap();
+        let os_socket_addr = Box::new(os_socketaddr::OsSocketAddr::from(socket_addr));
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(socket2::Protocol::TCP)).unwrap();
+
+        let fd = socket.into_raw_fd();
+        let ptr = os_socket_addr.as_ptr();
+        let len = os_socket_addr.len();
+        let opcode = opcode::Connect::new(types::Fd(fd), ptr, len);
+        executor::schedule_completion(op_id, false);
+        trace!("Scheduling connect completion for op={op_id} fd={} task_id={}", fd, executor::get_task_id());
+        if let Err(e) = uring::submit(opcode.build().user_data(op_id)) {
+            log::error!("Error submitting connect: {e}");
+        }
+        ConnectFuture { op_id, addr: os_socket_addr, fd }
     }
 
     pub fn recv<F>(&self, ptr: *mut u8, capacity: usize, f: F) -> anyhow::Result<()>
@@ -144,6 +192,7 @@ impl AsyncRead for TcpStream {
         me.read_op_id = Some(op_id);
         let ptr = buf.as_mut_ptr();
         let capacity = buf.len() as u32;
+        trace!("Scheduling recv completion for op={op_id} fd={} task_id={}", me.fd, executor::get_task_id());
         let op = opcode::Recv::new(types::Fd(me.fd), ptr, capacity);
         executor::schedule_completion(op_id, false);
         uring::submit(op.build().user_data(op_id)).expect("submit asyncread");
@@ -178,6 +227,7 @@ impl AsyncWrite for TcpStream {
         let ptr = buf.as_ptr();
         let capacity = buf.len() as u32;
         let op = opcode::Send::new(types::Fd(me.fd), ptr, capacity);
+        trace!("Scheduling send completion for op={op_id} fd={} task_id={}", me.fd, executor::get_task_id());
         executor::schedule_completion(op_id, false);
         if let Err(e) = uring::submit(op.build().user_data(op_id)) {
             Poll::Ready(Err(Error::new(std::io::ErrorKind::Other, format!("Uring problem: {e}"))))
@@ -197,7 +247,6 @@ impl AsyncWrite for TcpStream {
         if let Some(op_id) = me.close_op_id.take() {
             return match executor::get_result(op_id) {
                 Some(res) => {
-                    trace!("Got result {res}");
                     if res < 0 {
                         Poll::Ready(Err(std::io::Error::from_raw_os_error(-res)))
                     } else {
@@ -211,8 +260,9 @@ impl AsyncWrite for TcpStream {
         }
 
         let op_id = executor::get_next_op_id();
-        me.write_op_id = Some(op_id);
+        me.close_op_id = Some(op_id);
         let op = opcode::Close::new(types::Fd(me.fd));
+        trace!("Scheduling close completion for op={op_id} fd={} task_id={}", me.fd, executor::get_task_id());
         executor::schedule_completion(op_id, false);
         uring::submit(op.build().user_data(op_id)).expect("submit close");
 

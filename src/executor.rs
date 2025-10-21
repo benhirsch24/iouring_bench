@@ -6,10 +6,11 @@ use std::task::{Context, Poll, Waker};
 
 use crate::uring;
 
-use log::trace;
+use log::{trace, warn};
 
 struct ExecutorInner {
     results: HashMap<u64, i32>,
+    multi_results: HashMap<u64, Vec<i32>>,
     tasks: HashMap<u64, Pin<Box<dyn Future<Output = ()>>>>,
     op_to_task: HashMap<u64, (u64, bool)>,
     next_task_id: u64,
@@ -36,6 +37,7 @@ impl ExecutorInner {
     pub fn new() -> Self {
         Self {
             results: HashMap::new(),
+            multi_results: HashMap::new(),
             tasks: HashMap::new(),
             op_to_task: HashMap::new(),
             next_task_id: 0,
@@ -59,16 +61,16 @@ impl ExecutorInner {
 
     fn handle_completion(&mut self, op: u64, res: i32, _flags: u32) -> Result<(), anyhow::Error> {
         if !self.op_to_task.contains_key(&op) {
-            trace!("No op to task {op}");
+            warn!("No op to task {op}");
             anyhow::bail!("No completion {op}");
         }
 
         let (task_id, is_multi)  = self.op_to_task.get(&op).copied().unwrap();
         self.ready_queue.push(task_id);
-        self.results.insert(op, res);
-        trace!("Got task {task_id} for {op}");
         if !is_multi {
-            self.op_to_task.remove(&op);
+            self.results.insert(op, res);
+        } else {
+            self.multi_results.entry(op).or_insert(Vec::new()).push(res);
         }
         Ok(())
     }
@@ -113,7 +115,26 @@ impl ExecutorInner {
     }
 
     fn get_result(&mut self, op: u64) -> Option<i32> {
-        self.results.remove(&op)
+        if !self.op_to_task.contains_key(&op) {
+            warn!("No task for op={op}");
+            return None;
+        }
+        let (_, is_multi) = self.op_to_task.get(&op).unwrap();
+        if *is_multi {
+            if let Some(v) = self.multi_results.get_mut(&op) {
+                v.pop()
+            } else {
+                None
+            }
+        } else {
+            if let Some(res) = self.results.remove(&op) {
+                trace!("Removed op={op}");
+                self.op_to_task.remove(&op);
+                Some(res)
+            } else {
+                None
+            }
+        }
     }
 
     fn spawn(&mut self, fut: impl Future<Output = ()> + 'static) {
