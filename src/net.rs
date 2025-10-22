@@ -1,6 +1,6 @@
 use futures::{AsyncRead, AsyncWrite};
 use io_uring::{opcode, types};
-use log::{info, trace};
+use log::{trace};
 use socket2::{Socket, Domain, Type};
 
 use std::io::Error;
@@ -83,29 +83,41 @@ impl Future for AcceptFuture {
 }
 
 pub struct ConnectFuture {
-    op_id: u64,
+    op_id: Option<u64>,
     addr: Box<os_socketaddr::OsSocketAddr>,
     fd: RawFd,
+    done: bool,
 }
 
 impl Future for ConnectFuture {
     type Output = std::io::Result<TcpStream>;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let me = self.as_ref();
-        match executor::get_result(me.op_id) {
-            Some(res) => {
-                trace!("Got connect result {res} op={}", me.op_id);
-                if res < 0 {
-                    Poll::Ready(Err(std::io::Error::from_raw_os_error(-res)))
-                } else {
-                    Poll::Ready(Ok(TcpStream::new(me.fd)))
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut me = self.as_mut();
+        if me.done {
+            panic!("shouldn't poll again");
+        }
+
+        match me.op_id {
+            Some(op_id) => {
+                match executor::get_result(op_id) {
+                    Some(res) => {
+                        me.op_id = None;
+                        me.done = true;
+                        trace!("Got connect result {res} op={op_id}");
+                        if res < 0 {
+                            Poll::Ready(Err(std::io::Error::from_raw_os_error(-res)))
+                        } else {
+                            Poll::Ready(Ok(TcpStream::new(me.fd)))
+                        }
+                    },
+                    None => {
+                        trace!("Connect pending task_id={}", executor::get_task_id());
+                        Poll::Pending
+                    }
                 }
             },
-            None => {
-                trace!("Connect pending task_id={}", executor::get_task_id());
-                Poll::Pending
-            }
+            None => Poll::Pending
         }
     }
 }
@@ -147,7 +159,7 @@ impl TcpStream {
         if let Err(e) = uring::submit(opcode.build().user_data(op_id)) {
             log::error!("Error submitting connect: {e}");
         }
-        ConnectFuture { op_id, addr: os_socket_addr, fd }
+        ConnectFuture { op_id: Some(op_id), addr: os_socket_addr, fd, done: false }
     }
 
     pub fn recv<F>(&self, ptr: *mut u8, capacity: usize, f: F) -> anyhow::Result<()>
@@ -177,7 +189,7 @@ impl AsyncRead for TcpStream {
             trace!("Polling {op_id}");
             return match executor::get_result(op_id) {
                 Some(res) => {
-                        me.read_op_id = None;
+                    me.read_op_id = None;
                     trace!("Got recv result {res} op_id={}", op_id);
                     if res < 0 {
                         Poll::Ready(Err(std::io::Error::from_raw_os_error(-res)))

@@ -6,7 +6,6 @@ use log::{debug, error, info, trace};
 use rand::Rng;
 
 use std::io::Result;
-use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
 use iouring_bench::executor;
@@ -99,19 +98,21 @@ async fn handle_subscriber(endpoint: String, channel: String, end: Instant) -> R
     let mut reader = BufReader::new(stream);
     let mut last = Instant::now();
     let mut num_msgs = 0;
+    let mut total_msgs = 0;
     loop {
         if Instant::now() > end {
-            info!("Done!");
+            info!("Done! {total_msgs} received");
             return Ok(());
         }
 
         let mut line = String::new();
         reader.read_line(&mut line).await?;
         num_msgs += 1;
+        total_msgs += 1;
         debug!("Got line {line}");
 
         if last.elapsed() > Duration::from_secs(1) {
-            info!("Received {num_msgs} in last second");
+            debug!("Received {num_msgs} in last second");
             num_msgs = 0;
             last = Instant::now();
         }
@@ -142,11 +143,11 @@ fn main() -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     let end = args.timeout + start;
 
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     for n in 0..args.publishers {
         let channel_name = format!("Channel_{n}");
         // Add some jitter here for ramp up
-        let jitter_ms = rng.gen_range(10..100);
+        let jitter_ms = rng.random_range(10..100);
         std::thread::sleep(std::time::Duration::from_millis(jitter_ms));
 
         // Spawn a publisher

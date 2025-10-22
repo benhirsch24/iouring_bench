@@ -28,8 +28,14 @@ struct Args {
     sqpoll_interval_ms: u32,
 }
 
-async fn handle_publisher(mut reader: BufReader<unet::TcpStream>, mut writer: unet::TcpStream, channel: String, submap: Rc<RefCell<HashMap<String, HashMap<RawFd, unet::TcpStream>>>>) {
-    info!("Handling publisher fd={}", writer.as_raw_fd());
+#[derive(Default)]
+struct SubscriberInfo {
+    streams: HashMap<RawFd, unet::TcpStream>,
+    sent: u64,
+}
+
+async fn handle_publisher(mut reader: BufReader<unet::TcpStream>, mut writer: unet::TcpStream, channel: String, submap: Rc<RefCell<HashMap<String, SubscriberInfo>>>) {
+    debug!("Handling publisher fd={}", writer.as_raw_fd());
     let ok = b"OK\r\n";
     writer.write_all(ok).await.expect("OK");
     trace!("OK fd={}", writer.as_raw_fd());
@@ -47,7 +53,7 @@ async fn handle_publisher(mut reader: BufReader<unet::TcpStream>, mut writer: un
                 let streams = {
                     let mut streams = Vec::new();
                     if let Some(set) = submap.borrow().get(&channel) {
-                        for (_, s) in set.iter() {
+                        for (_, s) in set.streams.iter() {
                             streams.push(unet::TcpStream::new(s.as_raw_fd()));
                         }
                     }
@@ -56,10 +62,13 @@ async fn handle_publisher(mut reader: BufReader<unet::TcpStream>, mut writer: un
                 for mut s in streams {
                     executor::spawn({
                         let line = line.clone();
+                        let channel = channel.clone();
+                        let submap = submap.clone();
                         async move {
                             if let Err(e) = s.write_all(line.as_bytes()).await {
-                                error!("Failed to write line to fd={}", s.as_raw_fd());
+                                error!("Failed to write line to fd={}: {e}", s.as_raw_fd());
                             }
+                            submap.borrow_mut().get_mut(&channel).unwrap().sent += 1;
                         }
                     });
                 }
@@ -74,22 +83,22 @@ async fn handle_publisher(mut reader: BufReader<unet::TcpStream>, mut writer: un
 
 // After reading the subscribe message and sending OK, this task just keeps the subscriber alive until it leaves.
 // The publisher is writing directly to the file descriptor which is shared by the shared map.
-async fn handle_subscriber(mut reader: BufReader<unet::TcpStream>, mut writer: unet::TcpStream, channel: String, submap: Rc<RefCell<HashMap<String, HashMap<RawFd, unet::TcpStream>>>>) {
-    info!("Handling subscriber fd={}", writer.as_raw_fd());
+async fn handle_subscriber(mut reader: BufReader<unet::TcpStream>, mut writer: unet::TcpStream, channel: String, submap: Rc<RefCell<HashMap<String, SubscriberInfo>>>) {
+    debug!("Handling subscriber fd={}", writer.as_raw_fd());
     let ok = b"OK\r\n";
     writer.write_all(ok).await.expect("OK");
 
     let new_stream_fd = writer.as_raw_fd();
     let new_stream = unet::TcpStream::new(writer.as_raw_fd());
-    let _ = submap.borrow_mut().entry(channel.clone()).or_insert(HashMap::new()).insert(new_stream_fd, new_stream);
+    let _ = submap.borrow_mut().entry(channel.clone()).or_insert(SubscriberInfo::default()).streams.insert(new_stream_fd, new_stream);
 
     loop {
         let mut line = String::new();
         match reader.read_line(&mut line).await {
             Ok(n) => {
                 if n == 0 {
-                    info!("Subscriber left");
-                    let _ = submap.borrow_mut().get_mut(&channel).unwrap().remove(&new_stream_fd);
+                    debug!("Subscriber left");
+                    let _ = submap.borrow_mut().get_mut(&channel).unwrap().streams.remove(&new_stream_fd);
                     return;
                 }
                 debug!("Got message {line}");
@@ -100,11 +109,6 @@ async fn handle_subscriber(mut reader: BufReader<unet::TcpStream>, mut writer: u
             },
         }
     }
-}
-
-fn parse_channel(s: &String, start: usize) -> String {
-    let s = s.trim();
-    s[start..].to_string()
 }
 
 fn main() -> anyhow::Result<()> {
@@ -119,25 +123,36 @@ fn main() -> anyhow::Result<()> {
 
     executor::init();
 
-    executor::spawn(async {
-        let mut timeout = Timeout::new(Duration::from_secs(5), true);
-        loop {
-            timeout = timeout.await.expect("REASON");
-            let stats = uring::stats().expect("stats");
-            info!("Metrics: {}", stats);
+    // Map of channel name to subscriber info
+    let submap: Rc<RefCell<HashMap<String, SubscriberInfo>>> = Rc::new(RefCell::new(HashMap::new()));
+
+    // General metrics routine for uring, executor, application metrics every 5s
+    executor::spawn({
+        let submap = submap.clone();
+        async move {
+            let mut timeout = Timeout::new(Duration::from_secs(5), true);
+            loop {
+                timeout = timeout.await.expect("REASON");
+                let stats = uring::stats().expect("stats");
+                info!("Uring metrics: {}", stats);
+
+                // Print number of messages sent per subscriber so far
+                for (channel, subs) in submap.borrow().iter() {
+                    info!("{channel} sent {}", subs.sent);
+                }
+            }
         }
     });
 
-    executor::spawn(async {
+    executor::spawn(async move {
         let mut listener = unet::TcpListener::bind("0.0.0.0:8080").unwrap();
-        let submap = Rc::new(RefCell::new(HashMap::new()));
         loop {
-            info!("Accepting");
+            debug!("Accepting");
             let stream = listener.accept_multi_fut().unwrap().await.unwrap();
             let submap = submap.clone();
             executor::spawn(async move {
                 let task_id = executor::get_task_id();
-                info!("Got stream task_id={task_id} fd={}", stream.as_raw_fd());
+                debug!("Got stream task_id={task_id} fd={}", stream.as_raw_fd());
                 // TODO: idk, it's weird that I'm cloning the TcpStream. I could technically create
                 // a second read against it but that would be bad...
                 // Be careful!
@@ -154,10 +169,10 @@ fn main() -> anyhow::Result<()> {
                 }
                 trace!("Read protocol {line}");
                 if line.starts_with("PUBLISH") {
-                    let channel = parse_channel(&line, 8);
+                    let channel = line.trim()[8..].to_string();
                     handle_publisher(reader, writer, channel, submap).await;
                 } else if line.starts_with("SUBSCRIBE") {
-                    let channel = parse_channel(&line, 10);
+                    let channel = line.trim()[10..].to_string();
                     handle_subscriber(reader, writer, channel, submap).await;
                 } else {
                     warn!("Line had length {} but didn't start with expected protocol fd={fd}", line.len());
@@ -168,7 +183,7 @@ fn main() -> anyhow::Result<()> {
                 if let Err(e) = stream.close().await {
                     warn!("Failed to close fd={}: {e}", stream.as_raw_fd());
                 }
-                info!("Exiting task_id={task_id} fd={}", stream.as_raw_fd());
+                debug!("Exiting task_id={task_id} fd={}", stream.as_raw_fd());
             });
         }
         ()
