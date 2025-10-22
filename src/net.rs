@@ -20,7 +20,7 @@ pub struct TcpListener {
 
 impl TcpListener {
     pub fn bind<A: ToSocketAddrs>(addr: A) -> std::io::Result<TcpListener> {
-        let l = std::net::TcpListener::bind(addr)?;
+        let l = net2::TcpBuilder::new_v4()?.reuse_address(true)?.bind(&addr)?.listen(1024)?;
         Ok(TcpListener{
             l,
             accept_multi_op: None,

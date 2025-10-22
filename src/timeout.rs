@@ -1,5 +1,6 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use io_uring::{opcode, types};
 use log::trace;
@@ -15,8 +16,8 @@ pub struct TimeoutFuture {
 }
 
 impl TimeoutFuture {
-    pub fn from_secs(secs: u64, repeated: bool) -> Self {
-        let ts = types::Timespec::new().sec(secs).nsec(0);
+    pub fn new(dur: Duration, repeated: bool) -> Self {
+        let ts = types::Timespec::new().sec(dur.as_secs()).nsec(dur.subsec_nanos());
         let (timer_id, ts) = executor::register_timer(ts);
         let op_id = executor::get_next_op_id();
         let count = if repeated { 0 } else { 1 };
@@ -25,7 +26,7 @@ impl TimeoutFuture {
             .count(count)
             .build()
             .user_data(op_id);
-        trace!("Scheduling {secs}s {repeated} timeout op={op_id}");
+        trace!("Scheduling {dur:?} {repeated} timeout op={op_id}");
         executor::schedule_completion(op_id, true);
         uring::submit(timeout).expect("arm timeout");
         Self {

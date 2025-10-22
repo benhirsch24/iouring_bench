@@ -7,7 +7,7 @@ use rand::Rng;
 
 use std::io::Result;
 use std::os::fd::AsRawFd;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use iouring_bench::executor;
 use iouring_bench::uring;
@@ -78,7 +78,8 @@ async fn handle_publisher(tps: u32, endpoint: String, channel: String, end: Inst
         let _ = stream.write_all(message.as_bytes()).await?;
         trace!("Wrote message");
 
-        Timeout::from_secs(1, false).await?;
+        let interval = 1000 / tps;
+        Timeout::new(Duration::from_millis(interval.into()), false).await?;
     }
 }
 
@@ -96,6 +97,8 @@ async fn handle_subscriber(endpoint: String, channel: String, end: Instant) -> R
 
     // Start publishing
     let mut reader = BufReader::new(stream);
+    let mut last = Instant::now();
+    let mut num_msgs = 0;
     loop {
         if Instant::now() > end {
             info!("Done!");
@@ -104,7 +107,14 @@ async fn handle_subscriber(endpoint: String, channel: String, end: Instant) -> R
 
         let mut line = String::new();
         reader.read_line(&mut line).await?;
-        info!("Got line {line}");
+        num_msgs += 1;
+        debug!("Got line {line}");
+
+        if last.elapsed() > Duration::from_secs(1) {
+            info!("Received {num_msgs} in last second");
+            num_msgs = 0;
+            last = Instant::now();
+        }
     }
 }
 
@@ -121,7 +131,7 @@ fn main() -> anyhow::Result<()> {
     executor::init();
 
     executor::spawn(async {
-        let mut timeout = Timeout::from_secs(5, true);
+        let mut timeout = Timeout::new(Duration::from_secs(5), true);
         loop {
             timeout = timeout.await.expect("REASON");
             let stats = uring::stats().expect("stats");

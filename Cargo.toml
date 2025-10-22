@@ -24,6 +24,7 @@ futures = "0.3.31"
 os_socketaddr = "0.2.5"
 socket2 = "0.6.1"
 rand = "0.9.2"
+net2 = "0.2.39"
 
 [profile.release]
 opt-level = 3

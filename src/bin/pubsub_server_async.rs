@@ -5,6 +5,7 @@ use log::{error, debug, info, trace, warn};
 use std::collections::{HashMap};
 use std::{cell::RefCell, rc::Rc};
 use std::os::fd::RawFd;
+use std::time::Duration;
 
 use iouring_bench::executor;
 use iouring_bench::uring;
@@ -42,10 +43,25 @@ async fn handle_publisher(mut reader: BufReader<unet::TcpStream>, mut writer: un
                     return;
                 }
                 debug!("Got message {line}");
-                if let Some(set) = submap.borrow_mut().get_mut(&channel) {
-                    for (_, s) in set.iter_mut() {
-                        s.write_all(line.as_bytes()).await.expect("Write line");
+                // TODO: This is ugly af but it works
+                let streams = {
+                    let mut streams = Vec::new();
+                    if let Some(set) = submap.borrow().get(&channel) {
+                        for (_, s) in set.iter() {
+                            streams.push(unet::TcpStream::new(s.as_raw_fd()));
+                        }
                     }
+                    streams
+                };
+                for mut s in streams {
+                    executor::spawn({
+                        let line = line.clone();
+                        async move {
+                            if let Err(e) = s.write_all(line.as_bytes()).await {
+                                error!("Failed to write line to fd={}", s.as_raw_fd());
+                            }
+                        }
+                    });
                 }
             },
             Err(e) => {
@@ -56,6 +72,8 @@ async fn handle_publisher(mut reader: BufReader<unet::TcpStream>, mut writer: un
     }
 }
 
+// After reading the subscribe message and sending OK, this task just keeps the subscriber alive until it leaves.
+// The publisher is writing directly to the file descriptor which is shared by the shared map.
 async fn handle_subscriber(mut reader: BufReader<unet::TcpStream>, mut writer: unet::TcpStream, channel: String, submap: Rc<RefCell<HashMap<String, HashMap<RawFd, unet::TcpStream>>>>) {
     info!("Handling subscriber fd={}", writer.as_raw_fd());
     let ok = b"OK\r\n";
@@ -102,7 +120,7 @@ fn main() -> anyhow::Result<()> {
     executor::init();
 
     executor::spawn(async {
-        let mut timeout = Timeout::from_secs(5, true);
+        let mut timeout = Timeout::new(Duration::from_secs(5), true);
         loop {
             timeout = timeout.await.expect("REASON");
             let stats = uring::stats().expect("stats");
