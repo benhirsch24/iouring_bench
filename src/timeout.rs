@@ -2,6 +2,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use io_uring::{opcode, types};
+use log::trace;
 
 use crate::executor;
 use crate::uring;
@@ -24,6 +25,7 @@ impl TimeoutFuture {
             .count(count)
             .build()
             .user_data(op_id);
+        trace!("Scheduling {secs}s {repeated} timeout op={op_id}");
         executor::schedule_completion(op_id, true);
         uring::submit(timeout).expect("arm timeout");
         Self {

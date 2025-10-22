@@ -1,6 +1,6 @@
 use clap::{Parser};
 use futures::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use log::{error, debug, info, warn};
+use log::{error, debug, info, trace, warn};
 
 use std::collections::{HashMap};
 use std::{cell::RefCell, rc::Rc};
@@ -28,9 +28,10 @@ struct Args {
 }
 
 async fn handle_publisher(mut reader: BufReader<unet::TcpStream>, mut writer: unet::TcpStream, channel: String, submap: Rc<RefCell<HashMap<String, HashMap<RawFd, unet::TcpStream>>>>) {
-    info!("Handling publisher");
+    info!("Handling publisher fd={}", writer.as_raw_fd());
     let ok = b"OK\r\n";
     writer.write_all(ok).await.expect("OK");
+    trace!("OK fd={}", writer.as_raw_fd());
 
     loop {
         let mut line = String::new();
@@ -56,7 +57,7 @@ async fn handle_publisher(mut reader: BufReader<unet::TcpStream>, mut writer: un
 }
 
 async fn handle_subscriber(mut reader: BufReader<unet::TcpStream>, mut writer: unet::TcpStream, channel: String, submap: Rc<RefCell<HashMap<String, HashMap<RawFd, unet::TcpStream>>>>) {
-    info!("Handling subscriber");
+    info!("Handling subscriber fd={}", writer.as_raw_fd());
     let ok = b"OK\r\n";
     writer.write_all(ok).await.expect("OK");
 
@@ -126,12 +127,14 @@ fn main() -> anyhow::Result<()> {
                 let writer = unet::TcpStream::new(fd);
                 let mut reader = BufReader::new(stream);
                 let mut line = String::new();
+                trace!("Reading protocol line fd={fd} task_id={}", executor::get_task_id());
                 if let Err(e) = reader.read_line(&mut line).await {
                     error!("Failed to read line: {e}");
                     let mut stream = unet::TcpStream::new(fd);
                     stream.close().await.expect("Stream closing");
                     return;
                 }
+                trace!("Read protocol {line}");
                 if line.starts_with("PUBLISH") {
                     let channel = parse_channel(&line, 8);
                     handle_publisher(reader, writer, channel, submap).await;
@@ -139,7 +142,7 @@ fn main() -> anyhow::Result<()> {
                     let channel = parse_channel(&line, 10);
                     handle_subscriber(reader, writer, channel, submap).await;
                 } else {
-                    warn!("Line had length {} but didn't start with expected protocol", line.len());
+                    warn!("Line had length {} but didn't start with expected protocol fd={fd}", line.len());
                 }
                 // TODO: Again, weird that I'm re-creating the tcp stream to close it but oh
                 // wellsies

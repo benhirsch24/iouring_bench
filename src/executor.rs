@@ -66,6 +66,7 @@ impl ExecutorInner {
         }
 
         let (task_id, is_multi)  = self.op_to_task.get(&op).copied().unwrap();
+        trace!("handle_completion op={op} res={res} task_id={task_id} is_multi={is_multi}");
         self.ready_queue.push(task_id);
         if !is_multi {
             self.results.insert(op, res);
@@ -79,6 +80,7 @@ impl ExecutorInner {
         trace!("Ready queue len {}", self.ready_queue.len());
         for task_id in self.ready_queue.drain(..) {
             set_task_id(task_id);
+            trace!("Set task_id={task_id}");
             if let Some(mut task) = self.tasks.remove(&task_id) {
                 let mut ctx = Context::from_waker(Waker::noop());
                 match task.as_mut().poll(&mut ctx) {

@@ -2,7 +2,8 @@ use clap::{Parser};
 use clap_duration::duration_range_value_parse;
 use duration_human::{DurationHuman, DurationHumanValidator};
 use futures::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use log::{error, info, trace};
+use log::{debug, error, info, trace};
+use rand::Rng;
 
 use std::io::Result;
 use std::os::fd::AsRawFd;
@@ -42,24 +43,29 @@ struct Args {
 
     #[arg(short, long, default_value = "127.0.0.1:8080")]
     endpoint: String,
+
+    #[arg(long, default_value_t = 20)]
+    tps: u32,
 }
 
-async fn handle_publisher(endpoint: String, channel: String, end: Instant) -> Result<()> {
+async fn handle_publisher(tps: u32, endpoint: String, channel: String, end: Instant) -> Result<()> {
     info!("Connecting task={}", executor::get_task_id());
     let mut stream = unet::TcpStream::connect(endpoint).await?;
-    info!("Connected");
+    info!("Connected publisher {channel}");
 
     // Inform the server that we're a publisher
     let publish = format!("PUBLISH {channel}\r\n");
-    info!("Publish: \"{publish}\"");
+    debug!("Publish: \"{publish}\"");
     let _ = stream.write_all(publish.as_bytes()).await?;
 
     // Read back the OK message we expect
-    let mut ok = [0u8; 4];
+    let mut ok = [0u8; 16];
+    debug!("Reading ok");
     let _ = stream.read(&mut ok).await?;
     if !ok.starts_with(b"OK\r\n") {
         return Err(std::io::Error::new(std::io::ErrorKind::Other, "didn't get OK"));
     }
+    debug!("Got ok");
 
     // Start publishing
     loop {
@@ -71,14 +77,18 @@ async fn handle_publisher(endpoint: String, channel: String, end: Instant) -> Re
         let message = "here is my message\r\n";
         let _ = stream.write_all(message.as_bytes()).await?;
         trace!("Wrote message");
+
+        Timeout::from_secs(1, false).await?;
     }
 }
 
 async fn handle_subscriber(endpoint: String, channel: String, end: Instant) -> Result<()> {
     let mut stream = unet::TcpStream::connect(endpoint).await?;
+    info!("Connected subscriber {channel} fd={}", stream.as_raw_fd());
     let subscribe = format!("SUBSCRIBE {channel}\r\n");
     let _ = stream.write_all(subscribe.as_bytes()).await?;
     let mut ok = [0u8; 16];
+    debug!("Reading ok");
     let _ = stream.read(&mut ok).await?;
     if !ok.starts_with(b"OK\r\n") {
         return Err(std::io::Error::new(std::io::ErrorKind::Other, "didn't get OK"));
@@ -94,7 +104,7 @@ async fn handle_subscriber(endpoint: String, channel: String, end: Instant) -> R
 
         let mut line = String::new();
         reader.read_line(&mut line).await?;
-        trace!("Got line {line}");
+        info!("Got line {line}");
     }
 }
 
@@ -122,14 +132,19 @@ fn main() -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     let end = args.timeout + start;
 
+    let mut rng = rand::thread_rng();
     for n in 0..args.publishers {
         let channel_name = format!("Channel_{n}");
-        // Spawn 1 publisher
+        // Add some jitter here for ramp up
+        let jitter_ms = rng.gen_range(10..100);
+        std::thread::sleep(std::time::Duration::from_millis(jitter_ms));
+
+        // Spawn a publisher
         executor::spawn({
             let channel_name = channel_name.clone();
             let endpoint = args.endpoint.clone();
             async move {
-                if let Err(e) = handle_publisher(endpoint, channel_name.clone(), end).await {
+                if let Err(e) = handle_publisher(args.tps, endpoint, channel_name.clone(), end).await {
                     error!("Error on publisher {channel_name} {e}");
                 }
                 ()

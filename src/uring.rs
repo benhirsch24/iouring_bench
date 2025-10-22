@@ -177,9 +177,9 @@ impl Uring {
             for e in self.uring.completion() {
                 self.stats.completions_last_period += 1;
                 completed += 1;
-                trace!("completion result={} ud={}", e.result(), e.user_data());
+                trace!("completion result={} op={}", e.result(), e.user_data());
                 if let Err(err) = completion_handler(e.user_data(), e.result(), e.flags()) {
-                    error!("Error handling cqe (ud={} res={}): {err}", e.user_data(), e.result());
+                    error!("Error handling cqe (op={} res={}): {err}", e.user_data(), e.result());
                 }
             }
             completions_done_handler();
