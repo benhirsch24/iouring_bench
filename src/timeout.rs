@@ -19,15 +19,17 @@ impl TimeoutFuture {
     pub fn new(dur: Duration, repeated: bool) -> Self {
         let ts = types::Timespec::new().sec(dur.as_secs()).nsec(dur.subsec_nanos());
         let (timer_id, ts) = executor::register_timer(ts);
+        let task_id = executor::get_task_id();
         let op_id = executor::get_next_op_id();
         let count = if repeated { 0 } else { 1 };
-        let timeout = opcode::Timeout::new(ts)
-            .flags(types::TimeoutFlags::MULTISHOT)
-            .count(count)
-            .build()
-            .user_data(op_id);
-        trace!("Scheduling {dur:?} {repeated} timeout op={op_id}");
-        executor::schedule_completion(op_id, true);
+        let timeout = if repeated {
+            opcode::Timeout::new(ts).flags(types::TimeoutFlags::MULTISHOT)
+        } else {
+            opcode::Timeout::new(ts)
+        }
+        .build().user_data(op_id);
+        trace!("Scheduling timeout duration={dur:?} repeated={repeated} op={op_id} task_id={task_id}");
+        executor::schedule_completion(op_id, repeated);
         uring::submit(timeout).expect("arm timeout");
         Self {
             op_id,
@@ -46,11 +48,14 @@ impl Future for TimeoutFuture {
     type Output = std::io::Result<TimeoutFuture>;
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.as_ref();
+        let task_id = executor::get_task_id();
+        let op_id = me.op_id;
         if me.done {
             return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, "Timer already expired")));
         }
-        match executor::get_result(me.op_id) {
+        match executor::get_result(op_id) {
             Some(res) => {
+                trace!("Timeout done res={res} op_id={op_id} task_id={task_id}");
                 if !me.repeated {
                     executor::unregister_timer(me.timer_id);
                 }

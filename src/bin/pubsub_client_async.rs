@@ -67,13 +67,15 @@ async fn handle_publisher(tps: u32, endpoint: String, channel: String, end: Inst
     debug!("Got ok");
 
     // Start publishing
+    let mut n = 0;
     loop {
         if Instant::now() > end {
             info!("Done!");
             return Ok(());
         }
 
-        let message = format!("here is my message {}\r\n", channel);
+        let message = format!("here is my message {} {n}\r\n", channel);
+        n += 1;
         executor::spawn({
             let mut stream = unet::TcpStream::new(stream.as_raw_fd());
             async move {
@@ -82,12 +84,14 @@ async fn handle_publisher(tps: u32, endpoint: String, channel: String, end: Inst
                     error!("Error writing message {message}: {e}");
                     return;
                 }
-                trace!("Wrote message");
+                trace!("Wrote message {message}");
             }
         });
 
         let interval = 1000 / tps;
-        Timeout::new(Duration::from_millis(interval.into()), false).await?;
+        if let Err(e) = Timeout::new(Duration::from_millis(interval.into()), false).await {
+            error!("Timeout error: {e}");
+        }
     }
 }
 
@@ -129,7 +133,10 @@ async fn handle_subscriber(endpoint: String, channel: String, end: Instant) -> R
 }
 
 fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default())
+        .format_timestamp_millis() // Configure millisecond precision
+        .init();
+
     let args = Args::parse();
 
     uring::init(uring::UringArgs{

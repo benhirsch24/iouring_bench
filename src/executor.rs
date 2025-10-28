@@ -18,7 +18,7 @@ struct ExecutorInner {
     ready_queue: Vec<u64>,
 
     timer_id: u64,
-    timers: HashMap<u64, io_uring::types::Timespec>,
+    timers: HashMap<u64, Box<io_uring::types::Timespec>>,
 }
 
 thread_local! {
@@ -51,8 +51,10 @@ impl ExecutorInner {
     fn register_timer(&mut self, ts: io_uring::types::Timespec) -> (u64, *const io_uring::types::Timespec) {
         let id = self.timer_id;
         self.timer_id += 1;
-        self.timers.insert(id, ts);
-        (id, self.timers.get(&id).unwrap() as *const io_uring::types::Timespec)
+        let boxed = Box::new(ts);
+        let ptr = &*boxed as *const io_uring::types::Timespec;
+        self.timers.insert(id, boxed);
+        (id, ptr)
     }
 
     pub fn unregister_timer(&mut self, timer_id: u64) {

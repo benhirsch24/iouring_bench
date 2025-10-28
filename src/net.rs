@@ -196,7 +196,7 @@ impl AsyncRead for TcpStream {
                     if res < 0 {
                         Poll::Ready(Err(std::io::Error::from_raw_os_error(-res)))
                     } else {
-                        trace!("Ready {op_id} {res}");
+                        trace!("Recv ready {res} op_id={op_id} task_id={task_id} fd={fd}");
                         Poll::Ready(Ok(res as usize))
                     }
                 },
