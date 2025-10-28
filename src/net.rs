@@ -182,15 +182,17 @@ impl TcpStream {
 impl AsyncRead for TcpStream {
     fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, futures::io::Error>> {
         let mut me = self.as_mut();
+        let task_id = executor::get_task_id();
+        let fd = me.fd;
 
         // Only allow one read queued on a TcpStream at a time
         if me.read_op_id.is_some() {
             let op_id = me.read_op_id.unwrap();
-            trace!("Polling {op_id}");
+            trace!("Recv polling op_id={op_id} task_id={task_id} fd={fd}");
             return match executor::get_result(op_id) {
                 Some(res) => {
                     me.read_op_id = None;
-                    trace!("Got recv result {res} op_id={}", op_id);
+                    trace!("Got recv result {res}  op_id={op_id} task_id={task_id} fd={fd}");
                     if res < 0 {
                         Poll::Ready(Err(std::io::Error::from_raw_os_error(-res)))
                     } else {
@@ -221,15 +223,17 @@ impl AsyncRead for TcpStream {
 impl AsyncWrite for TcpStream {
     fn poll_write(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, futures::io::Error>> {
         let mut me = self.as_mut();
+        let task_id = executor::get_task_id();
+        let fd = me.fd;
 
         // Only allow one write queued on a TcpStream at a time
         if me.write_op_id.is_some() {
             let op_id = me.write_op_id.unwrap();
-            trace!("Polling {op_id}");
+            trace!("Write polling op_id={op_id} task_id={task_id} fd={fd}");
             return match executor::get_result(op_id) {
                 Some(res) => {
                         me.write_op_id = None;
-                    trace!("Got write result {res} fd={op_id}");
+                    trace!("Got write result {res} op_id={op_id} task_id={task_id} fd={fd}");
                     if res < 0 {
                         Poll::Ready(Err(std::io::Error::from_raw_os_error(-res)))
                     } else {

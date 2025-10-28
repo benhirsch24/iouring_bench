@@ -77,8 +77,9 @@ impl ExecutorInner {
     }
 
     fn handle_ready_queue(&mut self) {
-        trace!("Ready queue len {}", self.ready_queue.len());
-        for task_id in self.ready_queue.drain(..) {
+        trace!("Ready queue len {}: {:?}", self.ready_queue.len(), self.ready_queue);
+        let tasks: Vec<u64> = self.ready_queue.drain(..).collect();
+        for task_id in tasks {
             set_task_id(task_id);
             trace!("Set task_id={task_id}");
             if let Some(mut task) = self.tasks.remove(&task_id) {

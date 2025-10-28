@@ -35,10 +35,12 @@ struct SubscriberInfo {
 }
 
 async fn handle_publisher(mut reader: BufReader<unet::TcpStream>, mut writer: unet::TcpStream, channel: String, submap: Rc<RefCell<HashMap<String, SubscriberInfo>>>) {
-    debug!("Handling publisher fd={}", writer.as_raw_fd());
+    let task_id = executor::get_task_id();
+    let fd = writer.as_raw_fd();
+    debug!("Handling publisher channel={channel} fd={fd} task_id={task_id}");
     let ok = b"OK\r\n";
     writer.write_all(ok).await.expect("OK");
-    trace!("OK fd={}", writer.as_raw_fd());
+    trace!("OK fd={fd} task_id={task_id}");
 
     loop {
         let mut line = String::new();
@@ -48,7 +50,7 @@ async fn handle_publisher(mut reader: BufReader<unet::TcpStream>, mut writer: un
                     info!("Publisher left");
                     return;
                 }
-                debug!("Got message {line}");
+                debug!("Got message {line} channel={channel} fd={fd} task_id={task_id}");
                 // TODO: This is ugly af but it works
                 let streams = {
                     let mut streams = Vec::new();
@@ -61,12 +63,14 @@ async fn handle_publisher(mut reader: BufReader<unet::TcpStream>, mut writer: un
                 };
                 for mut s in streams {
                     executor::spawn({
+                        // TODO: could probably refcount this line. Maybe Bytes?
                         let line = line.clone();
                         let channel = channel.clone();
                         let submap = submap.clone();
                         async move {
+                            let task_id = executor::get_task_id();
                             if let Err(e) = s.write_all(line.as_bytes()).await {
-                                error!("Failed to write line to fd={}: {e}", s.as_raw_fd());
+                                error!("Failed to write line to channel={channel} fd={} task_id={task_id}: {e}", s.as_raw_fd());
                             }
                             submap.borrow_mut().get_mut(&channel).unwrap().sent += 1;
                         }
@@ -101,7 +105,6 @@ async fn handle_subscriber(mut reader: BufReader<unet::TcpStream>, mut writer: u
                     let _ = submap.borrow_mut().get_mut(&channel).unwrap().streams.remove(&new_stream_fd);
                     return;
                 }
-                debug!("Got message {line}");
             },
             Err(e) => {
                 error!("Got error {e}");
@@ -139,6 +142,9 @@ fn main() -> anyhow::Result<()> {
                 // Print number of messages sent per subscriber so far
                 for (channel, subs) in submap.borrow().iter() {
                     info!("{channel} sent {}", subs.sent);
+                }
+                for (_, subs) in submap.borrow_mut().iter_mut() {
+                    subs.sent = 0;
                 }
             }
         }

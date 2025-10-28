@@ -73,9 +73,18 @@ async fn handle_publisher(tps: u32, endpoint: String, channel: String, end: Inst
             return Ok(());
         }
 
-        let message = "here is my message\r\n";
-        let _ = stream.write_all(message.as_bytes()).await?;
-        trace!("Wrote message");
+        let message = format!("here is my message {}\r\n", channel);
+        executor::spawn({
+            let mut stream = unet::TcpStream::new(stream.as_raw_fd());
+            async move {
+                trace!("Writing message {message}");
+                if let Err(e) = stream.write_all(message.as_bytes()).await {
+                    error!("Error writing message {message}: {e}");
+                    return;
+                }
+                trace!("Wrote message");
+            }
+        });
 
         let interval = 1000 / tps;
         Timeout::new(Duration::from_millis(interval.into()), false).await?;
@@ -109,10 +118,10 @@ async fn handle_subscriber(endpoint: String, channel: String, end: Instant) -> R
         reader.read_line(&mut line).await?;
         num_msgs += 1;
         total_msgs += 1;
-        debug!("Got line {line}");
+        trace!("Got line {line}");
 
         if last.elapsed() > Duration::from_secs(1) {
-            debug!("Received {num_msgs} in last second");
+            debug!("Channel {channel} received {num_msgs} in last second");
             num_msgs = 0;
             last = Instant::now();
         }
@@ -154,6 +163,7 @@ fn main() -> anyhow::Result<()> {
         executor::spawn({
             let channel_name = channel_name.clone();
             let endpoint = args.endpoint.clone();
+            debug!("Starting publisher for {channel_name}");
             async move {
                 if let Err(e) = handle_publisher(args.tps, endpoint, channel_name.clone(), end).await {
                     error!("Error on publisher {channel_name} {e}");
@@ -167,6 +177,7 @@ fn main() -> anyhow::Result<()> {
             executor::spawn({
                 let channel_name = channel_name.clone();
                 let endpoint = args.endpoint.clone();
+                debug!("Starting subscriber for {channel_name}");
                 async move {
                     if let Err(e) = handle_subscriber(endpoint, channel_name.clone(), end).await {
                         error!("Error on publisher {channel_name} {e}");
