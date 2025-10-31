@@ -5,7 +5,9 @@ use futures::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use log::{debug, error, info, trace};
 use rand::Rng;
 
+use std::collections::HashMap;
 use std::io::Result;
+use std::{rc::Rc, cell::RefCell};
 use std::time::{Duration, Instant};
 
 use iouring_bench::executor;
@@ -47,7 +49,37 @@ struct Args {
     tps: u32,
 }
 
-async fn handle_publisher(tps: u32, endpoint: String, channel: String, end: Instant) -> Result<()> {
+#[derive(Clone)]
+struct Stats {
+    writes: Rc<RefCell<HashMap<String, u64>>>,
+}
+
+impl Stats {
+    fn new() -> Self {
+        Self {
+            writes: Rc::new(RefCell::new(HashMap::new())),
+        }
+    }
+
+    fn write(&mut self, channel: &String) {
+        let mut m = self.writes.borrow_mut();
+        *m.entry(channel.to_string()).or_insert(0) += 1;
+    }
+}
+
+impl std::fmt::Display for Stats {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let mut total = 0;
+        for (channel, writes) in self.writes.borrow().iter() {
+            writeln!(f, "channel={channel} writes={writes}")?;
+            total += writes;
+        }
+        write!(f, "total={total}")?;
+        Ok(())
+    }
+}
+
+async fn handle_publisher(tps: u32, endpoint: String, channel: String, end: Instant, mut stats: Stats) -> Result<()> {
     info!("Connecting task={}", executor::get_task_id());
     let mut stream = unet::TcpStream::connect(endpoint).await?;
     info!("Connected publisher {channel}");
@@ -62,12 +94,15 @@ async fn handle_publisher(tps: u32, endpoint: String, channel: String, end: Inst
     debug!("Reading ok");
     let _ = stream.read(&mut ok).await?;
     if !ok.starts_with(b"OK\r\n") {
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, "didn't get OK"));
+        return Err(std::io::Error::other("didn't get OK"));
     }
     debug!("Got ok");
 
     // Start publishing
     let mut n = 0;
+    let interval = Duration::from_millis((1000 / tps).into());
+    let start_time = Instant::now();
+
     loop {
         if Instant::now() > end {
             info!("Done!");
@@ -76,22 +111,24 @@ async fn handle_publisher(tps: u32, endpoint: String, channel: String, end: Inst
 
         let message = format!("here is my message {} {n}\r\n", channel);
         n += 1;
-        executor::spawn({
-            let mut stream = unet::TcpStream::new(stream.as_raw_fd());
-            async move {
-                trace!("Writing message {message}");
-                if let Err(e) = stream.write_all(message.as_bytes()).await {
-                    error!("Error writing message {message}: {e}");
-                    return;
-                }
-                trace!("Wrote message {message}");
-            }
-        });
-
-        let interval = 1000 / tps;
-        if let Err(e) = Timeout::new(Duration::from_millis(interval.into()), false).await {
-            error!("Timeout error: {e}");
+        trace!("Writing message {} channel={channel}", message.replace("\n", "\\n").replace("\r", "\\r"));
+        if let Err(e) = stream.write_all(message.as_bytes()).await {
+            error!("Error writing message {message}: {e}");
+            return Ok(());
         }
+        stats.write(&channel);
+        trace!("Wrote message {} channel={channel}", message.replace("\n", "\\n").replace("\r", "\\r"));
+
+        // Sleep until the next scheduled time
+        let next_target = start_time + interval * n;
+        let now = Instant::now();
+        if next_target > now {
+            Timeout::new(next_target - now, false).await?;
+        } else {
+            // We're running behind - log a warning if needed
+            trace!("Running behind schedule by {:?}", now - next_target);
+        }
+
     }
 }
 
@@ -104,7 +141,7 @@ async fn handle_subscriber(endpoint: String, channel: String, end: Instant) -> R
     debug!("Reading ok");
     let _ = stream.read(&mut ok).await?;
     if !ok.starts_with(b"OK\r\n") {
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, "didn't get OK"));
+        return Err(std::io::Error::other("didn't get OK"));
     }
 
     // Start publishing
@@ -156,6 +193,17 @@ fn main() -> anyhow::Result<()> {
         }
     });
 
+    // At the very end display stats
+    let stats = Stats::new();
+    executor::spawn({
+        let stats = stats.clone();
+        async move {
+            let end = args.timeout + std::time::Instant::now() + Duration::from_millis(25);
+            let _ = Timeout::new(end - std::time::Instant::now(), false).await;
+            info!("Stats: {}", stats);
+        }
+    });
+
     let start = std::time::Instant::now();
     let end = args.timeout + start;
 
@@ -170,16 +218,16 @@ fn main() -> anyhow::Result<()> {
         executor::spawn({
             let channel_name = channel_name.clone();
             let endpoint = args.endpoint.clone();
+            let stats = stats.clone();
             debug!("Starting publisher for {channel_name}");
             async move {
-                if let Err(e) = handle_publisher(args.tps, endpoint, channel_name.clone(), end).await {
+                if let Err(e) = handle_publisher(args.tps, endpoint, channel_name.clone(), end, stats).await {
                     error!("Error on publisher {channel_name} {e}");
                 }
-                ()
             }
         });
 
-        // Spawn S subscribers
+        // Spawn subscribers
         for _s in 0..args.subscribers_per_publisher {
             executor::spawn({
                 let channel_name = channel_name.clone();
@@ -189,7 +237,6 @@ fn main() -> anyhow::Result<()> {
                     if let Err(e) = handle_subscriber(endpoint, channel_name.clone(), end).await {
                         error!("Error on publisher {channel_name} {e}");
                     }
-                    ()
                 }
             });
         }

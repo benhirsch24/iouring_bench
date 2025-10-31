@@ -94,7 +94,7 @@ impl Connection {
         let read_e = opcode::Recv::new(self.fd, ptr, (self.read_buffer.capacity() - self.read_buffer.len()) as u32);
         let ud = UserData::new(Op::Recv, self.fd.0);
         trace!("read: {} {:?}", ud, self.fd);
-        return read_e.build().user_data(ud.into_u64()).into();
+        read_e.build().user_data(ud.into_u64())
     }
 
     // Advances the internal read buffer by setting the new length.
@@ -125,7 +125,7 @@ impl Connection {
         }
         self.last_write = Some(std::time::Instant::now());
 
-        Some(send_e.build().user_data(ud.into_u64()).into())
+        Some(send_e.build().user_data(ud.into_u64()))
     }
 
     fn serve(&mut self) -> anyhow::Result<ConnectionResult> {

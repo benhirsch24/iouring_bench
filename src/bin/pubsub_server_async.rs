@@ -50,7 +50,7 @@ async fn handle_publisher(mut reader: BufReader<unet::TcpStream>, mut writer: un
                     info!("Publisher left");
                     return;
                 }
-                debug!("Got message {line} channel={channel} fd={fd} task_id={task_id}");
+                debug!("Got message {} channel={channel} fd={fd} task_id={task_id}", line.replace("\n", "\\n").replace("\r", "\\r"));
                 // TODO: This is ugly af but it works
                 let streams = {
                     let mut streams = Vec::new();
@@ -88,7 +88,7 @@ async fn handle_publisher(mut reader: BufReader<unet::TcpStream>, mut writer: un
 // After reading the subscribe message and sending OK, this task just keeps the subscriber alive until it leaves.
 // The publisher is writing directly to the file descriptor which is shared by the shared map.
 async fn handle_subscriber(mut reader: BufReader<unet::TcpStream>, mut writer: unet::TcpStream, channel: String, submap: Rc<RefCell<HashMap<String, SubscriberInfo>>>) {
-    debug!("Handling subscriber fd={}", writer.as_raw_fd());
+    debug!("Handling subscriber channel={channel} fd={}", writer.as_raw_fd());
     let ok = b"OK\r\n";
     writer.write_all(ok).await.expect("OK");
 

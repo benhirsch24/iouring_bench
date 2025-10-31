@@ -84,7 +84,7 @@ impl Future for AcceptFuture {
 
 pub struct ConnectFuture {
     op_id: Option<u64>,
-    addr: Box<os_socketaddr::OsSocketAddr>,
+    _addr: Box<os_socketaddr::OsSocketAddr>,
     fd: RawFd,
     done: bool,
 }
@@ -159,7 +159,7 @@ impl TcpStream {
         if let Err(e) = uring::submit(opcode.build().user_data(op_id)) {
             log::error!("Error submitting connect: {e}");
         }
-        ConnectFuture { op_id: Some(op_id), addr: os_socket_addr, fd, done: false }
+        ConnectFuture { op_id: Some(op_id), _addr: os_socket_addr, fd, done: false }
     }
 
     pub fn recv<F>(&self, ptr: *mut u8, capacity: usize, f: F) -> anyhow::Result<()>

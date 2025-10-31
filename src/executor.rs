@@ -79,24 +79,27 @@ impl ExecutorInner {
     }
 
     fn handle_ready_queue(&mut self) {
+        let start = std::time::Instant::now();
         trace!("Ready queue len {}: {:?}", self.ready_queue.len(), self.ready_queue);
-        let tasks: Vec<u64> = self.ready_queue.drain(..).collect();
-        for task_id in tasks {
-            set_task_id(task_id);
+        for task_id in self.ready_queue.iter() {
+            set_task_id(*task_id);
             trace!("Set task_id={task_id}");
-            if let Some(mut task) = self.tasks.remove(&task_id) {
+            if let Some(mut task) = self.tasks.remove(task_id) {
+                let start = std::time::Instant::now();
                 let mut ctx = Context::from_waker(Waker::noop());
                 match task.as_mut().poll(&mut ctx) {
                     Poll::Ready(_) => {
-                        trace!("Task {task_id} complete");
+                        trace!("Task complete in {:?} task_id={task_id}", start.elapsed());
                     },
                     Poll::Pending => {
-                        trace!("Task still pending {task_id}");
-                        self.tasks.insert(task_id, Box::pin(task));
+                        trace!("Task still pending in {:?} task_id={task_id}", start.elapsed());
+                        self.tasks.insert(*task_id, task);
                     },
                 }
             }
         }
+        self.ready_queue.clear();
+        trace!("Ready queue handled in {:?}", start.elapsed());
     }
 
     pub fn run(&mut self) {
@@ -143,7 +146,9 @@ impl ExecutorInner {
     }
 
     fn spawn(&mut self, fut: impl Future<Output = ()> + 'static) {
+        let cur_task = get_task_id();
         let task_id = self.get_next_task_id();
+        trace!("Spawning new task task_id={task_id} cur_task={cur_task}");
         self.tasks.insert(task_id, Box::pin(fut));
         self.ready_queue.push(task_id);
     }

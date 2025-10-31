@@ -21,7 +21,6 @@ impl TimeoutFuture {
         let (timer_id, ts) = executor::register_timer(ts);
         let task_id = executor::get_task_id();
         let op_id = executor::get_next_op_id();
-        let count = if repeated { 0 } else { 1 };
         let timeout = if repeated {
             opcode::Timeout::new(ts).flags(types::TimeoutFlags::MULTISHOT)
         } else {
@@ -51,7 +50,7 @@ impl Future for TimeoutFuture {
         let task_id = executor::get_task_id();
         let op_id = me.op_id;
         if me.done {
-            return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, "Timer already expired")));
+            return Poll::Ready(Err(std::io::Error::other("Timer already expired")));
         }
         match executor::get_result(op_id) {
             Some(res) => {

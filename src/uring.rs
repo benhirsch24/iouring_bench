@@ -64,7 +64,7 @@ pub struct Uring {
 // This allows us to call uring::run(...); and then from within the run function or the passed-in
 // request factory function call uring::submit(...);
 thread_local! {
-    static URING: UnsafeCell<Option<Uring>> = UnsafeCell::new(None);
+    static URING: UnsafeCell<Option<Uring>> = const { UnsafeCell::new(None) };
 }
 
 pub fn init(args: UringArgs) -> Result<(), std::io::Error> {
