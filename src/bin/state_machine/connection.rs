@@ -7,9 +7,10 @@ use std::collections::HashMap;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use iouring_bench::uring;
+use iouring_bench::user_data::{Op, UserData};
+
 use crate::pubsub::{Buffer, BufferPool, PubsubState};
-use crate::user_data::{Op, UserData};
-use crate::uring;
 
 static BUFFER_SIZE : usize = 1024*1024;
 

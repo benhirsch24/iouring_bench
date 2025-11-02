@@ -8,13 +8,13 @@ use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
 
-pub mod connection;
+mod connection;
 use connection::*;
-pub mod pubsub;
+mod pubsub;
 use pubsub::BufferPool;
-pub mod uring;
-pub mod user_data;
-use user_data::{Op, UserData};
+
+use iouring_bench::uring;
+use iouring_bench::user_data::{Op, UserData};
 
 const SILLY_TEXT: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/silly_text.txt"));
 
