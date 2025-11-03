@@ -1,35 +1,18 @@
 use clap::{Parser};
 use clap_duration::duration_range_value_parse;
 use duration_human::{DurationHuman, DurationHumanValidator};
-use futures::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader, AsyncReadExt, AsyncWriteExt};
 use log::{debug, error, info, trace};
 use rand::Rng;
 
 use std::collections::HashMap;
 use std::io::Result;
-use std::{rc::Rc, cell::RefCell};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-use iouring_bench::executor;
-use iouring_bench::uring;
-use iouring_bench::net as unet;
-use iouring_bench::timeout::TimeoutFuture as Timeout;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// Size of uring submission queue
-    #[arg(short, long, default_value_t = 4096)]
-    uring_size: u32,
-
-    /// Number of submissions in the backlog before submitting to uring
-    #[arg(short, long, default_value_t = 1024)]
-    submissions_threshold: usize,
-
-    /// Interval for kernel submission queue polling. If 0 then sqpoll is disabled. Default 0.
-    #[arg(short = 'i', long, default_value_t = 0)]
-    sqpoll_interval_ms: u32,
-
     /// How many publishers to create
     #[arg(short, long, default_value_t = 1)]
     publishers: u32,
@@ -54,26 +37,26 @@ struct Args {
 
 #[derive(Clone)]
 struct Stats {
-    writes: Rc<RefCell<HashMap<String, u64>>>,
+    writes: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl Stats {
     fn new() -> Self {
         Self {
-            writes: Rc::new(RefCell::new(HashMap::new())),
+            writes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     fn write(&mut self, channel: &String) {
-        let mut m = self.writes.borrow_mut();
-        *m.entry(channel.to_string()).or_insert(0) += 1;
+        *self.writes.lock().unwrap().entry(channel.to_string()).or_insert(0) += 1;
     }
 }
 
 impl std::fmt::Display for Stats {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let mut total = 0;
-        for (channel, writes) in self.writes.borrow().iter() {
+        let writes = self.writes.lock().unwrap();
+        for (channel, writes) in writes.iter() {
             writeln!(f, "channel={channel} writes={writes}")?;
             total += writes;
         }
@@ -107,8 +90,8 @@ impl Publisher {
         }
     }
     async fn run(&mut self, end: Instant) -> Result<()> {
-        info!("Connecting task={}", executor::get_task_id());
-        let mut stream = unet::TcpStream::connect(self.endpoint.clone()).await?;
+        info!("Connecting");
+        let mut stream = tokio::net::TcpStream::connect(self.endpoint.clone()).await?;
         info!("Connected publisher {}", self.channel);
 
         // Inform the server that we're a publisher
@@ -117,7 +100,7 @@ impl Publisher {
         let _ = stream.write_all(publish.as_bytes()).await?;
 
         // Read back the OK message we expect
-        let mut ok = [0u8; 16];
+        let mut ok = [0u8; 4];
         debug!("Reading ok");
         let _ = stream.read(&mut ok).await?;
         if !ok.starts_with(b"OK\r\n") {
@@ -149,7 +132,7 @@ impl Publisher {
             let next_target = start_time + interval * n;
             let now = Instant::now();
             if next_target > now {
-                Timeout::new(next_target - now, false).await?;
+                tokio::time::sleep(next_target - now).await;
             } else {
                 // We're running behind - log a warning if needed
                 trace!("Running behind schedule by {:?}", now - next_target);
@@ -160,11 +143,11 @@ impl Publisher {
 }
 
 async fn handle_subscriber(endpoint: String, channel: String, end: Instant) -> Result<()> {
-    let mut stream = unet::TcpStream::connect(endpoint).await?;
-    info!("Connected subscriber {channel} fd={}", stream.as_raw_fd());
+    let mut stream = tokio::net::TcpStream::connect(endpoint).await?;
+    info!("Connected subscriber {channel}");
     let subscribe = format!("SUBSCRIBE {channel}\r\n");
     let _ = stream.write_all(subscribe.as_bytes()).await?;
-    let mut ok = [0u8; 16];
+    let mut ok = [0u8; 4];
     debug!("Reading ok");
     let _ = stream.read(&mut ok).await?;
     if !ok.starts_with(b"OK\r\n") {
@@ -183,7 +166,8 @@ async fn handle_subscriber(endpoint: String, channel: String, end: Instant) -> R
         }
 
         let mut line = String::new();
-        reader.read_line(&mut line).await?;
+        reader.read_line(&mut line).await?; // TODO: Subscribers never return because they get
+                                            // blocked here
         num_msgs += 1;
         total_msgs += 1;
         trace!("Got line {line}");
@@ -196,37 +180,21 @@ async fn handle_subscriber(endpoint: String, channel: String, end: Instant) -> R
     }
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default())
         .format_timestamp_millis() // Configure millisecond precision
         .init();
 
     let args = Args::parse();
 
-    uring::init(uring::UringArgs{
-        uring_size: args.uring_size,
-        submissions_threshold: args.submissions_threshold,
-        sqpoll_interval_ms: args.sqpoll_interval_ms,
-    })?;
-
-    executor::init();
-
-    executor::spawn(async {
-        let mut timeout = Timeout::new(Duration::from_secs(5), true);
-        loop {
-            timeout = timeout.await.expect("REASON");
-            let stats = uring::stats().expect("stats");
-            info!("Metrics: {}", stats);
-        }
-    });
-
     // At the very end display stats
     let stats = Stats::new();
-    executor::spawn({
+    tokio::spawn({
         let stats = stats.clone();
         async move {
             let end = args.timeout + std::time::Instant::now() + Duration::from_millis(25);
-            let _ = Timeout::new(end - std::time::Instant::now(), false).await;
+            let _ = tokio::time::sleep(end - std::time::Instant::now()).await;
             info!("Stats: {}", stats);
         }
     });
@@ -235,6 +203,7 @@ fn main() -> anyhow::Result<()> {
     let end = args.timeout + start;
 
     let mut rng = rand::rng();
+    let mut set = tokio::task::JoinSet::new();
     for n in 0..args.publishers {
         let channel_name = format!("Channel_{n}");
         // Add some jitter here for ramp up
@@ -242,7 +211,7 @@ fn main() -> anyhow::Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(jitter_ms));
 
         // Spawn a publisher
-        executor::spawn({
+        set.spawn(tokio::spawn({
             let channel_name = channel_name.clone();
             let endpoint = args.endpoint.clone();
             let stats = stats.clone();
@@ -259,11 +228,11 @@ fn main() -> anyhow::Result<()> {
                     error!("Error on publisher {channel_name} {e}");
                 }
             }
-        });
+        }));
 
         // Spawn subscribers
         for _s in 0..args.subscribers_per_publisher {
-            executor::spawn({
+            set.spawn(tokio::spawn({
                 let channel_name = channel_name.clone();
                 let endpoint = args.endpoint.clone();
                 debug!("Starting subscriber for {channel_name}");
@@ -272,11 +241,11 @@ fn main() -> anyhow::Result<()> {
                         error!("Error on publisher {channel_name} {e}");
                     }
                 }
-            });
+            }));
         }
     }
 
-    executor::run();
+    let _ = set.join_all().await;
 
     Ok(())
 }

@@ -22,15 +22,15 @@ struct ExecutorInner {
 }
 
 thread_local! {
-    static THREAD_ID: Cell<u64> = Cell::new(0);
+    static TASK_ID: Cell<u64> = Cell::new(0);
 }
 
 pub fn get_task_id() -> u64 {
-    THREAD_ID.get()
+    TASK_ID.get()
 }
 
 fn set_task_id(new_task_id: u64) {
-    THREAD_ID.set(new_task_id)
+    TASK_ID.set(new_task_id)
 }
 
 impl ExecutorInner {
