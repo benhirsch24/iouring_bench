@@ -81,7 +81,8 @@ impl ExecutorInner {
     fn handle_ready_queue(&mut self) {
         let start = std::time::Instant::now();
         trace!("Ready queue len {}: {:?}", self.ready_queue.len(), self.ready_queue);
-        for task_id in self.ready_queue.iter() {
+        let ready_queue = std::mem::take(&mut self.ready_queue);
+        for task_id in ready_queue.iter() {
             set_task_id(*task_id);
             trace!("Set task_id={task_id}");
             if let Some(mut task) = self.tasks.remove(task_id) {
@@ -98,7 +99,6 @@ impl ExecutorInner {
                 }
             }
         }
-        self.ready_queue.clear();
         trace!("Ready queue handled in {:?}", start.elapsed());
     }
 
