@@ -1,9 +1,12 @@
 use clap::{Parser};
 use tokio::io::{AsyncBufReadExt, BufReader, AsyncReadExt, AsyncWriteExt};
+use tokio::runtime::Builder;
+use tokio::task::{LocalSet, spawn_local};
 use log::{error, debug, info, trace, warn};
 
 use std::collections::{HashMap};
 use std::sync::{Arc, Mutex};
+use std::{rc::Rc, cell::RefCell};
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::Duration;
 
@@ -14,12 +17,12 @@ struct SubscribersInner {
 
 #[derive(Clone)]
 struct Subscribers {
-    inner: Arc<Mutex<HashMap<String, SubscribersInner>>>,
+    inner: Rc<RefCell<HashMap<String, SubscribersInner>>>,
 }
 
 impl Subscribers {
     fn get_tx(&mut self, channel: &String) -> tokio::sync::broadcast::Sender<String> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.borrow_mut();
         if !inner.contains_key(channel) {
             let (tx, mut rx) = tokio::sync::broadcast::channel(1024);
             inner.insert(channel.clone(), SubscribersInner{ sent: 0, tx: tx.clone() });
@@ -29,7 +32,7 @@ impl Subscribers {
     }
 
     fn get_rx(&mut self, channel: &String) -> tokio::sync::broadcast::Receiver<String> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.borrow_mut();
         if !inner.contains_key(channel) {
             let (tx, mut rx) = tokio::sync::broadcast::channel(1024);
             inner.insert(channel.clone(), SubscribersInner{ sent: 0, tx });
@@ -106,63 +109,73 @@ async fn handle_subscriber(mut stream: tokio::net::TcpStream, channel: String, m
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     env_logger::init();
 
-    // Map of channel name to subscriber info
-    let subscribers = Subscribers {
-        inner: Arc::new(Mutex::new(HashMap::new())),
-    };
+    let runtime = Builder::new_current_thread()
+        .worker_threads(1)
+        .thread_name("thready")
+        .enable_io()
+        .enable_time()
+        .build()
+        .unwrap();
 
-    // General metrics routine for application metrics every 5s
-    tokio::spawn({
-        let subscribers = subscribers.clone();
-        async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                {
-                    let mut subscribers = subscribers.inner.lock().unwrap();
-                    // Print number of messages sent per subscriber so far
-                    for (channel, subs) in subscribers.iter_mut() {
-                        info!("{channel} sent {}", subs.sent);
-                        subs.sent = 0;
+    let local = LocalSet::new();
+    runtime.block_on(local.run_until(async {
+        // Map of channel name to subscriber info
+        let subscribers = Subscribers {
+            inner: Rc::new(RefCell::new(HashMap::new())),
+        };
+
+        // General metrics routine for application metrics every 5s
+        tokio::task::spawn_local({
+            let subscribers = subscribers.clone();
+            async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    {
+                        let mut subscribers = subscribers.inner.borrow_mut();
+                        // Print number of messages sent per subscriber so far
+                        for (channel, subs) in subscribers.iter_mut() {
+                            info!("{channel} sent {}", subs.sent);
+                            subs.sent = 0;
+                        }
                     }
                 }
             }
-        }
-    });
-
-    let mut listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
-    loop {
-        debug!("Accepting");
-        let (stream, _) = listener.accept().await.unwrap();
-        let subscribers = subscribers.clone();
-        tokio::spawn(async move {
-            debug!("Got stream fd={}", stream.as_raw_fd());
-            let mut reader = BufReader::new(stream);
-            let mut line = String::new();
-            trace!("Reading protocol line");
-            if let Err(e) = reader.read_line(&mut line).await {
-                error!("Failed to read line: {e}");
-                // TODO: closing?
-                return;
-            }
-            trace!("Read protocol {line}");
-            let stream = reader.into_inner(); // Assume that we only wrote the protocol line
-            if line.starts_with("PUBLISH") {
-                let channel = line.trim()[8..].to_string();
-                handle_publisher(stream, channel, subscribers).await;
-            } else if line.starts_with("SUBSCRIBE") {
-                let channel = line.trim()[10..].to_string();
-                handle_subscriber(stream, channel, subscribers).await;
-            } else {
-                warn!("Line had length {} but didn't start with expected protocol", line.len());
-            }
-            // TODO: Closing?
-            debug!("Exiting");
         });
-    }
 
-    Ok(())
+        let mut listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
+        loop {
+            debug!("Accepting");
+            let (stream, _) = listener.accept().await.unwrap();
+            let subscribers = subscribers.clone();
+            tokio::task::spawn_local(async move {
+                debug!("Got stream fd={}", stream.as_raw_fd());
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                trace!("Reading protocol line");
+                if let Err(e) = reader.read_line(&mut line).await {
+                    error!("Failed to read line: {e}");
+                    // TODO: closing?
+                    return;
+                }
+                trace!("Read protocol {line}");
+                let stream = reader.into_inner(); // Assume that we only wrote the protocol line
+                if line.starts_with("PUBLISH") {
+                    let channel = line.trim()[8..].to_string();
+                    handle_publisher(stream, channel, subscribers).await;
+                } else if line.starts_with("SUBSCRIBE") {
+                    let channel = line.trim()[10..].to_string();
+                    handle_subscriber(stream, channel, subscribers).await;
+                } else {
+                    warn!("Line had length {} but didn't start with expected protocol", line.len());
+                }
+                // TODO: Closing?
+                debug!("Exiting");
+            });
+        }
+
+        Ok(())
+    }))
 }

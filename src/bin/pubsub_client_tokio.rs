@@ -2,12 +2,15 @@ use clap::{Parser};
 use clap_duration::duration_range_value_parse;
 use duration_human::{DurationHuman, DurationHumanValidator};
 use tokio::io::{AsyncBufReadExt, BufReader, AsyncReadExt, AsyncWriteExt};
+use tokio::runtime::Builder;
+use tokio::task::{LocalSet, spawn_local};
 use log::{debug, error, info, trace};
 use rand::Rng;
 
 use std::collections::HashMap;
 use std::io::Result;
 use std::sync::{Arc, Mutex};
+use std::{rc::Rc, cell::RefCell};
 use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
@@ -37,25 +40,25 @@ struct Args {
 
 #[derive(Clone)]
 struct Stats {
-    writes: Arc<Mutex<HashMap<String, u64>>>,
+    writes: Rc<RefCell<HashMap<String, u64>>>,
 }
 
 impl Stats {
     fn new() -> Self {
         Self {
-            writes: Arc::new(Mutex::new(HashMap::new())),
+            writes: Rc::new(RefCell::new(HashMap::new())),
         }
     }
 
     fn write(&mut self, channel: &String) {
-        *self.writes.lock().unwrap().entry(channel.to_string()).or_insert(0) += 1;
+        *self.writes.borrow_mut().entry(channel.to_string()).or_insert(0) += 1;
     }
 }
 
 impl std::fmt::Display for Stats {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let mut total = 0;
-        let writes = self.writes.lock().unwrap();
+        let writes = self.writes.borrow_mut();
         for (channel, writes) in writes.iter() {
             writeln!(f, "channel={channel} writes={writes}")?;
             total += writes;
@@ -180,72 +183,82 @@ async fn handle_subscriber(endpoint: String, channel: String, end: Instant) -> R
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default())
         .format_timestamp_millis() // Configure millisecond precision
         .init();
 
     let args = Args::parse();
 
-    // At the very end display stats
-    let stats = Stats::new();
-    tokio::spawn({
-        let stats = stats.clone();
-        async move {
-            let end = args.timeout + std::time::Instant::now() + Duration::from_millis(25);
-            let _ = tokio::time::sleep(end - std::time::Instant::now()).await;
-            info!("Stats: {}", stats);
-        }
-    });
+    let runtime = Builder::new_current_thread()
+        .worker_threads(1)
+        .thread_name("thready")
+        .enable_io()
+        .enable_time()
+        .build()
+        .unwrap();
 
-    let start = std::time::Instant::now();
-    let end = args.timeout + start;
-
-    let mut rng = rand::rng();
-    let mut set = tokio::task::JoinSet::new();
-    for n in 0..args.publishers {
-        let channel_name = format!("Channel_{n}");
-        // Add some jitter here for ramp up
-        let jitter_ms = rng.random_range(10..100);
-        std::thread::sleep(std::time::Duration::from_millis(jitter_ms));
-
-        // Spawn a publisher
-        set.spawn(tokio::spawn({
-            let channel_name = channel_name.clone();
-            let endpoint = args.endpoint.clone();
+    let local = LocalSet::new();
+    runtime.block_on(local.run_until(async {
+        // At the very end display stats
+        let stats = Stats::new();
+        tokio::task::spawn_local({
             let stats = stats.clone();
-            debug!("Starting publisher for {channel_name}");
             async move {
-                let mut publisher = Publisher::new(
-                    args.tps,
-                    endpoint,
-                    channel_name.clone(),
-                    stats,
-                    args.message_size,
-                );
-                if let Err(e) = publisher.run(end).await {
-                    error!("Error on publisher {channel_name} {e}");
-                }
+                let end = args.timeout + std::time::Instant::now() + Duration::from_millis(25);
+                let _ = tokio::time::sleep(end - std::time::Instant::now()).await;
+                info!("Stats: {}", stats);
             }
-        }));
+        });
 
-        // Spawn subscribers
-        for _s in 0..args.subscribers_per_publisher {
-            set.spawn(tokio::spawn({
+        let start = std::time::Instant::now();
+        let end = args.timeout + start;
+
+        let mut rng = rand::rng();
+        let mut set = tokio::task::JoinSet::new();
+        for n in 0..args.publishers {
+            let channel_name = format!("Channel_{n}");
+            // Add some jitter here for ramp up
+            let jitter_ms = rng.random_range(10..100);
+            std::thread::sleep(std::time::Duration::from_millis(jitter_ms));
+
+            // Spawn a publisher
+            set.spawn(tokio::task::spawn_local({
                 let channel_name = channel_name.clone();
                 let endpoint = args.endpoint.clone();
-                debug!("Starting subscriber for {channel_name}");
+                let stats = stats.clone();
+                debug!("Starting publisher for {channel_name}");
                 async move {
-                    if let Err(e) = handle_subscriber(endpoint, channel_name.clone(), end).await {
+                    let mut publisher = Publisher::new(
+                        args.tps,
+                        endpoint,
+                        channel_name.clone(),
+                        stats,
+                        args.message_size,
+                    );
+                    if let Err(e) = publisher.run(end).await {
                         error!("Error on publisher {channel_name} {e}");
                     }
                 }
             }));
+
+            // Spawn subscribers
+            for _s in 0..args.subscribers_per_publisher {
+                set.spawn(tokio::task::spawn_local({
+                    let channel_name = channel_name.clone();
+                    let endpoint = args.endpoint.clone();
+                    debug!("Starting subscriber for {channel_name}");
+                    async move {
+                        if let Err(e) = handle_subscriber(endpoint, channel_name.clone(), end).await {
+                            error!("Error on publisher {channel_name} {e}");
+                        }
+                    }
+                }));
+            }
         }
-    }
 
-    let _ = set.join_all().await;
+        let _ = set.join_all().await;
 
-    Ok(())
+        Ok(())
+    }))
 }
