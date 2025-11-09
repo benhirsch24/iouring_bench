@@ -299,7 +299,9 @@ impl Connection {
 
     fn subscribe_recv(&mut self) -> anyhow::Result<ConnectionResult> {
         // The only valid read result from a subscriber is a BYE message
-        if let Some(msg) = self.read_line() && &msg == "BYE\r\n" {
+        if let Some(msg) = self.read_line()
+            && &msg == "BYE\r\n"
+        {
             let channel = match &self.connection_state {
                 ConnectionState::Subscriber(c) => c,
                 _ => panic!("unexpected"),
@@ -371,9 +373,9 @@ impl Connection {
                         uring::submit(send)?;
                     } else if let Some(o) = self.cache.get(&parts[2].to_string()) {
                         self.set_response(&format!(
-                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
-                                o.len(),
-                                o
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                            o.len(),
+                            o
                         ));
                         let send = self
                             .send(0)
@@ -452,7 +454,9 @@ impl Connection {
                     uring::submit(e)?;
                 }
 
-                if let ConnectionState::Http = self.connection_state && done{
+                if let ConnectionState::Http = self.connection_state
+                    && done
+                {
                     return Ok(ConnectionResult::Done);
                 }
             }

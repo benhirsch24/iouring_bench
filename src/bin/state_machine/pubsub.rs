@@ -20,10 +20,7 @@ impl PubsubState {
     }
 
     pub fn subscribe(&mut self, channel: String, fd: RawFd) {
-        self.subscribers
-            .entry(channel)
-            .or_default()
-            .insert(fd);
+        self.subscribers.entry(channel).or_default().insert(fd);
     }
 
     pub fn remove(&mut self, channel: &String, fd: RawFd) {

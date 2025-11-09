@@ -111,7 +111,7 @@ fn read_message_recursive(
             if *done.borrow() == 0 {
                 uring::exit();
             }
-            return Ok(())
+            return Ok(());
         }
 
         // You lose cancellation but oh well for this example.

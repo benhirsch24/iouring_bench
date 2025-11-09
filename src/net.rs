@@ -56,9 +56,7 @@ impl TcpListener {
             executor::get_task_id()
         );
         if let Err(e) = uring::submit(opcode.build().user_data(op_id)) {
-            Err(std::io::Error::other(
-                format!("Uring problem: {e}"),
-            ))
+            Err(std::io::Error::other(format!("Uring problem: {e}")))
         } else {
             Ok(AcceptFuture { op_id })
         }
@@ -286,9 +284,7 @@ impl AsyncWrite for TcpStream {
         );
         executor::schedule_completion(op_id, false);
         if let Err(e) = uring::submit(op.build().user_data(op_id)) {
-            Poll::Ready(Err(Error::other(
-                format!("Uring problem: {e}"),
-            )))
+            Poll::Ready(Err(Error::other(format!("Uring problem: {e}"))))
         } else {
             Poll::Pending
         }

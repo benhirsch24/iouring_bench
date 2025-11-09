@@ -117,11 +117,7 @@ impl ExecutorInner {
 
     pub fn run(&mut self) {
         // Run the main uring loop using our callback
-        uring::run(
-            handle_completion,
-            handle_ready_queue,
-        )
-        .expect("running uring");
+        uring::run(handle_completion, handle_ready_queue).expect("running uring");
     }
 
     fn get_next_op_id(&mut self) -> u64 {

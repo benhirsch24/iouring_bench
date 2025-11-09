@@ -1,5 +1,12 @@
 # TODO
 
+Async implementation:
+
+* Read into buffer inside File & TcpStream for proper implementation
+* Kernel buffers
+
+Old stuff:
+
 **Handle connections closed by peer**
 
 Recv will return 0, need to handle that in Connection::serve() probably to make sure that all subscribers get BYE messages.
@@ -15,3 +22,4 @@ I like the idea of a buffer pool struct that manages all the buffers that each c
 **Abstraction around callbacks and buffers**
 
 Keep the core uring event loop steady, create an abstraction around adding callbacks and allocating buffers that are separate.
+
