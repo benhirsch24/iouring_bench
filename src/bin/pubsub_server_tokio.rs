@@ -1,14 +1,11 @@
-use clap::{Parser};
-use tokio::io::{AsyncBufReadExt, BufReader, AsyncReadExt, AsyncWriteExt};
+use log::{debug, error, info, trace, warn};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::runtime::Builder;
-use tokio::task::{LocalSet, spawn_local};
-use log::{error, debug, info, trace, warn};
+use tokio::task::LocalSet;
 
-use std::collections::{HashMap};
-use std::sync::{Arc, Mutex};
-use std::{rc::Rc, cell::RefCell};
-use std::os::fd::{AsRawFd, RawFd};
-use std::time::Duration;
+use std::collections::HashMap;
+use std::os::fd::AsRawFd;
+use std::{cell::RefCell, rc::Rc};
 
 struct SubscribersInner {
     sent: u64,
@@ -24,8 +21,14 @@ impl Subscribers {
     fn get_tx(&mut self, channel: &String) -> tokio::sync::broadcast::Sender<String> {
         let mut inner = self.inner.borrow_mut();
         if !inner.contains_key(channel) {
-            let (tx, mut rx) = tokio::sync::broadcast::channel(1024);
-            inner.insert(channel.clone(), SubscribersInner{ sent: 0, tx: tx.clone() });
+            let (tx, _rx) = tokio::sync::broadcast::channel(1024);
+            inner.insert(
+                channel.clone(),
+                SubscribersInner {
+                    sent: 0,
+                    tx: tx.clone(),
+                },
+            );
             return tx;
         }
         inner.get(channel).unwrap().tx.clone()
@@ -34,15 +37,19 @@ impl Subscribers {
     fn get_rx(&mut self, channel: &String) -> tokio::sync::broadcast::Receiver<String> {
         let mut inner = self.inner.borrow_mut();
         if !inner.contains_key(channel) {
-            let (tx, mut rx) = tokio::sync::broadcast::channel(1024);
-            inner.insert(channel.clone(), SubscribersInner{ sent: 0, tx });
+            let (tx, rx) = tokio::sync::broadcast::channel(1024);
+            inner.insert(channel.clone(), SubscribersInner { sent: 0, tx });
             return rx;
         }
         inner.get(channel).unwrap().tx.subscribe()
     }
 }
 
-async fn handle_publisher(mut stream: tokio::net::TcpStream, channel: String, mut subscribers: Subscribers) {
+async fn handle_publisher(
+    mut stream: tokio::net::TcpStream,
+    channel: String,
+    mut subscribers: Subscribers,
+) {
     let fd = stream.as_raw_fd();
     debug!("Handling publisher channel={channel} fd={fd}");
     let ok = b"OK\r\n";
@@ -60,21 +67,31 @@ async fn handle_publisher(mut stream: tokio::net::TcpStream, channel: String, mu
                     info!("Publisher left");
                     return;
                 }
-                debug!("Got message {} channel={channel} fd={fd}", line.replace("\n", "\\n").replace("\r", "\\r"));
-                tx.send(line);
-            },
+                debug!(
+                    "Got message {} channel={channel} fd={fd}",
+                    line.replace("\n", "\\n").replace("\r", "\\r")
+                );
+                let _ = tx.send(line);
+            }
             Err(e) => {
                 error!("Got error {e}");
                 return;
-            },
+            }
         }
     }
 }
 
 // After reading the subscribe message and sending OK, this task just keeps the subscriber alive until it leaves.
 // The publisher is writing directly to the file descriptor which is shared by the shared map.
-async fn handle_subscriber(mut stream: tokio::net::TcpStream, channel: String, mut subscribers: Subscribers) {
-    debug!("Handling subscriber channel={channel} fd={}", stream.as_raw_fd());
+async fn handle_subscriber(
+    mut stream: tokio::net::TcpStream,
+    channel: String,
+    mut subscribers: Subscribers,
+) {
+    debug!(
+        "Handling subscriber channel={channel} fd={}",
+        stream.as_raw_fd()
+    );
     let ok = b"OK\r\n";
     stream.write_all(ok).await.expect("OK");
 
@@ -102,7 +119,7 @@ async fn handle_subscriber(mut stream: tokio::net::TcpStream, channel: String, m
             msg = rx.recv() => {
                 let msg = msg.expect("unwrapped");
                 if let Err(e) = write.write_all(msg.as_bytes()).await {
-                    error!("Failed to write line to channel={channel}");
+                    error!("Failed to write line to channel={channel}: {e}");
                 }
             },
         };
@@ -145,7 +162,7 @@ fn main() -> anyhow::Result<()> {
             }
         });
 
-        let mut listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
         loop {
             debug!("Accepting");
             let (stream, _) = listener.accept().await.unwrap();
@@ -169,7 +186,10 @@ fn main() -> anyhow::Result<()> {
                     let channel = line.trim()[10..].to_string();
                     handle_subscriber(stream, channel, subscribers).await;
                 } else {
-                    warn!("Line had length {} but didn't start with expected protocol", line.len());
+                    warn!(
+                        "Line had length {} but didn't start with expected protocol",
+                        line.len()
+                    );
                 }
                 // TODO: Closing?
                 debug!("Exiting");

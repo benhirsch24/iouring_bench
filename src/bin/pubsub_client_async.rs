@@ -1,4 +1,4 @@
-use clap::{Parser};
+use clap::Parser;
 use clap_duration::duration_range_value_parse;
 use duration_human::{DurationHuman, DurationHumanValidator};
 use futures::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -7,13 +7,13 @@ use rand::Rng;
 
 use std::collections::HashMap;
 use std::io::Result;
-use std::{rc::Rc, cell::RefCell};
 use std::time::{Duration, Instant};
+use std::{cell::RefCell, rc::Rc};
 
 use iouring_bench::executor;
-use iouring_bench::uring;
 use iouring_bench::net as unet;
 use iouring_bench::timeout::TimeoutFuture as Timeout;
+use iouring_bench::uring;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -94,8 +94,9 @@ impl Publisher {
     fn new(tps: u32, endpoint: String, channel: String, stats: Stats, message_size: usize) -> Self {
         let message_base = "bring more tacos"; // chatgpt generated 16 character quip :rolleyes:
         let repeated = message_size / message_base.len();
-        let message = format!("{}_{}", channel, message_base.repeat(repeated));
-        let message = format!("{}\r\n", message[0..message_size].to_string());
+        let message_body = format!("{}_{}", channel, message_base.repeat(repeated));
+        let slice_end = message_size.min(message_body.len());
+        let message = format!("{}\r\n", &message_body[..slice_end]);
         println!("{}", message.len());
 
         Self {
@@ -114,7 +115,7 @@ impl Publisher {
         // Inform the server that we're a publisher
         let publish = format!("PUBLISH {}\r\n", self.channel);
         debug!("Publish: \"{publish}\"");
-        let _ = stream.write_all(publish.as_bytes()).await?;
+        stream.write_all(publish.as_bytes()).await?;
 
         // Read back the OK message we expect
         let mut ok = [0u8; 16];
@@ -137,13 +138,21 @@ impl Publisher {
             }
 
             n += 1;
-            trace!("Writing message {} channel={}", self.message.replace("\n", "\\n").replace("\r", "\\r"), self.channel);
+            trace!(
+                "Writing message {} channel={}",
+                self.message.replace("\n", "\\n").replace("\r", "\\r"),
+                self.channel
+            );
             if let Err(e) = stream.write_all(self.message.as_bytes()).await {
                 error!("Error writing message {}: {e}", self.message);
                 return Ok(());
             }
             self.stats.write(&self.channel);
-            trace!("Wrote message {} channel={}", self.message.replace("\n", "\\n").replace("\r", "\\r"), self.channel);
+            trace!(
+                "Wrote message {} channel={}",
+                self.message.replace("\n", "\\n").replace("\r", "\\r"),
+                self.channel
+            );
 
             // Sleep until the next scheduled time
             let next_target = start_time + interval * n;
@@ -154,7 +163,6 @@ impl Publisher {
                 // We're running behind - log a warning if needed
                 trace!("Running behind schedule by {:?}", now - next_target);
             }
-
         }
     }
 }
@@ -163,7 +171,7 @@ async fn handle_subscriber(endpoint: String, channel: String, end: Instant) -> R
     let mut stream = unet::TcpStream::connect(endpoint).await?;
     info!("Connected subscriber {channel} fd={}", stream.as_raw_fd());
     let subscribe = format!("SUBSCRIBE {channel}\r\n");
-    let _ = stream.write_all(subscribe.as_bytes()).await?;
+    stream.write_all(subscribe.as_bytes()).await?;
     let mut ok = [0u8; 16];
     debug!("Reading ok");
     let _ = stream.read(&mut ok).await?;
@@ -203,7 +211,7 @@ fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    uring::init(uring::UringArgs{
+    uring::init(uring::UringArgs {
         uring_size: args.uring_size,
         submissions_threshold: args.submissions_threshold,
         sqpoll_interval_ms: args.sqpoll_interval_ms,

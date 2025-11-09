@@ -1,7 +1,7 @@
-use std::collections::HashMap;
-use std::cell::UnsafeCell;
-use io_uring::squeue::Entry;
 use crate::uring;
+use io_uring::squeue::Entry;
+use std::cell::UnsafeCell;
+use std::collections::HashMap;
 
 struct CallbackRegistry {
     map: HashMap<u64, Box<dyn FnOnce(i32) -> anyhow::Result<()>>>,
@@ -20,7 +20,7 @@ impl CallbackRegistry {
 
     fn add_callback<T>(&mut self, f: T) -> u64
     where
-    T: FnOnce(i32) -> anyhow::Result<()> + 'static
+        T: FnOnce(i32) -> anyhow::Result<()> + 'static,
     {
         let c = self.counter;
         self.map.insert(c, Box::new(f));
@@ -32,7 +32,7 @@ impl CallbackRegistry {
         let cb = self.map.remove(&id);
         match cb {
             Some(cb) => cb(res),
-            None => anyhow::bail!("No callback registered for {id} res={res}")
+            None => anyhow::bail!("No callback registered for {id} res={res}"),
         }
     }
 }
@@ -42,29 +42,25 @@ thread_local! {
 }
 
 pub fn add_callback<F>(f: F) -> u64
-    where
-        F: FnOnce(i32) -> anyhow::Result<()> + 'static
+where
+    F: FnOnce(i32) -> anyhow::Result<()> + 'static,
 {
-    CB.with(|cbr| {
-        unsafe {
-            let cb_ref = &mut *cbr.get();
-            cb_ref.add_callback(Box::new(f))
-        }
+    CB.with(|cbr| unsafe {
+        let cb_ref = &mut *cbr.get();
+        cb_ref.add_callback(Box::new(f))
     })
 }
 
 pub fn call_back(id: u64, res: i32) -> anyhow::Result<()> {
-    CB.with(|cbr| {
-        unsafe {
-            let cb_ref = &mut *cbr.get();
-            cb_ref.call_back(id, res)
-        }
+    CB.with(|cbr| unsafe {
+        let cb_ref = &mut *cbr.get();
+        cb_ref.call_back(id, res)
     })
 }
 
 pub fn submit_entry<F>(entry: Entry, f: F) -> anyhow::Result<()>
-    where
-        F: FnOnce(i32) -> anyhow::Result<()> + 'static
+where
+    F: FnOnce(i32) -> anyhow::Result<()> + 'static,
 {
     let ud = add_callback(Box::new(f));
     uring::submit(entry.user_data(ud))?;

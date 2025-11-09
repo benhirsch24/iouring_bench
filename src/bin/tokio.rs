@@ -2,18 +2,22 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use bytes::Bytes;
-use clap::{Parser};
-use log::{debug, info, error};
+use clap::Parser;
+use log::{debug, error, info};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::runtime::Builder;
 use tokio::task::{LocalSet, spawn_local};
 
-static BUFFER_SIZE : usize = 1024*1024;
-const HEALTH_OK: &'static str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
-const NOT_FOUND: &'static str = "HTTP/1.1 404 Not Found\r\nContent-Length: 8\r\n\r\nNotFound";
-const BAD_REQUEST: &'static str = "HTTP/1.1 400 Bad Request\r\nContent-Length: 25\r\n\r\nExpected /object/<object>";
-const SILLY_TEXT: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/silly_text.txt"));
+static BUFFER_SIZE: usize = 1024 * 1024;
+const HEALTH_OK: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+const NOT_FOUND: &str = "HTTP/1.1 404 Not Found\r\nContent-Length: 8\r\n\r\nNotFound";
+const BAD_REQUEST: &str =
+    "HTTP/1.1 400 Bad Request\r\nContent-Length: 25\r\n\r\nExpected /object/<object>";
+const SILLY_TEXT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/silly_text.txt"
+));
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -38,7 +42,9 @@ fn main() -> std::io::Result<()> {
     let chunk_size = args.chunk_size;
     runtime.block_on(local.run_until(async {
         let mut cache = Rc::new(HashMap::new());
-        Rc::get_mut(&mut cache).unwrap().insert("1".to_string(), SILLY_TEXT.to_string());
+        Rc::get_mut(&mut cache)
+            .unwrap()
+            .insert("1".to_string(), SILLY_TEXT.to_string());
 
         let listener = TcpListener::bind("0.0.0.0:8080").await?;
         loop {
@@ -66,38 +72,47 @@ fn main() -> std::io::Result<()> {
                             p if p.starts_with("/object") => {
                                 let parts = p.split("/").collect::<Vec<_>>();
                                 if parts.len() != 3 {
-                                    stream.write(BAD_REQUEST.as_bytes()).await.unwrap();
-                                } else {
-                                    if let Some(o) = cache.get(&parts[2].to_string()) {
-                                        // Write out the file in chunks
-                                        let resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}", o.len(), o);
-                                        let bs = Bytes::copy_from_slice(resp.as_bytes());
-                                        let mut start = 0;
-                                        loop {
-                                            if start == bs.len() {
-                                                return;
-                                            }
-                                            let end = if start + chunk_size > bs.len() { bs.len() } else { start + chunk_size };
-                                            match stream.write(&bs.slice(start..end)).await {
-                                                Ok(n) => { debug!("Wrote {n}"); start += n },
-                                                Err(e) => error!("Did nto write all {}", e)
-                                            };
+                                    stream.write_all(BAD_REQUEST.as_bytes()).await.unwrap();
+                                } else if let Some(o) = cache.get(&parts[2].to_string()) {
+                                    // Write out the file in chunks
+                                    let resp = format!(
+                                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                                        o.len(),
+                                        o
+                                    );
+                                    let bs = Bytes::copy_from_slice(resp.as_bytes());
+                                    let mut start = 0;
+                                    loop {
+                                        if start == bs.len() {
+                                            return;
                                         }
-                                    } else {
-                                        stream.write(NOT_FOUND.as_bytes()).await.unwrap();
+                                        let end = if start + chunk_size > bs.len() {
+                                            bs.len()
+                                        } else {
+                                            start + chunk_size
+                                        };
+                                        match stream.write(&bs.slice(start..end)).await {
+                                            Ok(n) => {
+                                                debug!("Wrote {n}");
+                                                start += n
+                                            }
+                                            Err(e) => error!("Did nto write all {}", e),
+                                        };
                                     }
+                                } else {
+                                    stream.write_all(NOT_FOUND.as_bytes()).await.unwrap();
                                 }
-                            },
+                            }
                             "/health" => {
-                                stream.write(HEALTH_OK.as_bytes()).await.unwrap();
-                            },
+                                stream.write_all(HEALTH_OK.as_bytes()).await.unwrap();
+                            }
                             _ => {
-                                stream.write(NOT_FOUND.as_bytes()).await.unwrap();
+                                stream.write_all(NOT_FOUND.as_bytes()).await.unwrap();
                             }
                         }
-                    },
+                    }
                     None => {
-                        stream.write(NOT_FOUND.as_bytes()).await.unwrap();
+                        stream.write_all(NOT_FOUND.as_bytes()).await.unwrap();
                     }
                 }
             });
