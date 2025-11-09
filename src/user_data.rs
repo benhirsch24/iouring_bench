@@ -1,5 +1,5 @@
-use std::fmt;
 use std::convert::TryFrom;
+use std::fmt;
 use std::os::unix::io::RawFd;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -8,7 +8,7 @@ pub enum IOError {
 }
 
 const TAG_SHIFT: u64 = 32;
-const LOW_MASK:  u64 = 0xFFFF_FFFF;
+const LOW_MASK: u64 = 0xFFFF_FFFF;
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash)]
 pub struct UserData(u64);
@@ -26,10 +26,9 @@ impl std::fmt::Display for UserData {
     }
 }
 
-
 impl UserData {
     #[inline]
-    pub fn new (op: Op, fd: RawFd) -> Self {
+    pub fn new(op: Op, fd: RawFd) -> Self {
         Self::from_raw_parts(op.to_u32(), fd as u32)
     }
 
@@ -77,12 +76,16 @@ impl UserData {
 
     /// The packed `u64`.
     #[inline]
-    pub const fn into_u64(self) -> u64 { self.0 }
+    pub const fn into_u64(self) -> u64 {
+        self.0
+    }
 }
 
 impl From<UserData> for u64 {
     #[inline]
-    fn from(p: UserData) -> u64 { p.0 }
+    fn from(p: UserData) -> u64 {
+        p.0
+    }
 }
 
 impl From<(u32, u32)> for UserData {
@@ -108,14 +111,19 @@ impl fmt::Debug for UserData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (k, lo) = self.to_raw_parts();
         match self.op() {
-            Ok(op) => write!(f, "UserData {{ op: {:?} ({:#010x}), low: {:#010x}, u64: {:#018x} }}",
-            op, k, lo, self.0),
-            Err(raw) => write!(f, "UserData {{ op: <unknown> ({:#010x}), low: {:#010x}, u64: {:#018x} }}",
-            raw, lo, self.0),
+            Ok(op) => write!(
+                f,
+                "UserData {{ op: {:?} ({:#010x}), low: {:#010x}, u64: {:#018x} }}",
+                op, k, lo, self.0
+            ),
+            Err(raw) => write!(
+                f,
+                "UserData {{ op: <unknown> ({:#010x}), low: {:#010x}, u64: {:#018x} }}",
+                raw, lo, self.0
+            ),
         }
     }
 }
-
 
 #[repr(u32)]
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]

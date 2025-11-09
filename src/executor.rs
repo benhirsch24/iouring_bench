@@ -1,8 +1,11 @@
-use std::{cell::{Cell, UnsafeCell}, rc::Rc};
+use std::cell::{Cell, UnsafeCell};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
+
+#[cfg(test)]
+use std::rc::Rc;
 
 use crate::uring;
 
@@ -22,7 +25,7 @@ struct ExecutorInner {
 }
 
 thread_local! {
-    static TASK_ID: Cell<u64> = Cell::new(0);
+    static TASK_ID: Cell<u64> = const { Cell::new(0) };
 }
 
 pub fn get_task_id() -> u64 {
@@ -48,7 +51,10 @@ impl ExecutorInner {
         }
     }
 
-    fn register_timer(&mut self, ts: io_uring::types::Timespec) -> (u64, *const io_uring::types::Timespec) {
+    fn register_timer(
+        &mut self,
+        ts: io_uring::types::Timespec,
+    ) -> (u64, *const io_uring::types::Timespec) {
         let id = self.timer_id;
         self.timer_id += 1;
         let boxed = Box::new(ts);
@@ -67,20 +73,24 @@ impl ExecutorInner {
             anyhow::bail!("No completion {op}");
         }
 
-        let (task_id, is_multi)  = self.op_to_task.get(&op).copied().unwrap();
+        let (task_id, is_multi) = self.op_to_task.get(&op).copied().unwrap();
         trace!("handle_completion op={op} res={res} task_id={task_id} is_multi={is_multi}");
         self.ready_queue.push(task_id);
         if !is_multi {
             self.results.insert(op, res);
         } else {
-            self.multi_results.entry(op).or_insert(Vec::new()).push(res);
+            self.multi_results.entry(op).or_default().push(res);
         }
         Ok(())
     }
 
     fn handle_ready_queue(&mut self) {
         let start = std::time::Instant::now();
-        trace!("Ready queue len {}: {:?}", self.ready_queue.len(), self.ready_queue);
+        trace!(
+            "Ready queue len {}: {:?}",
+            self.ready_queue.len(),
+            self.ready_queue
+        );
         let ready_queue = std::mem::take(&mut self.ready_queue);
         for task_id in ready_queue.iter() {
             set_task_id(*task_id);
@@ -91,11 +101,14 @@ impl ExecutorInner {
                 match task.as_mut().poll(&mut ctx) {
                     Poll::Ready(_) => {
                         trace!("Task complete in {:?} task_id={task_id}", start.elapsed());
-                    },
+                    }
                     Poll::Pending => {
-                        trace!("Task still pending in {:?} task_id={task_id}", start.elapsed());
+                        trace!(
+                            "Task still pending in {:?} task_id={task_id}",
+                            start.elapsed()
+                        );
                         self.tasks.insert(*task_id, task);
-                    },
+                    }
                 }
             }
         }
@@ -105,9 +118,10 @@ impl ExecutorInner {
     pub fn run(&mut self) {
         // Run the main uring loop using our callback
         uring::run(
-            |op, res, flags| handle_completion(op, res, flags),
-            || { handle_ready_queue() },
-        ).expect("running uring");
+            handle_completion,
+            handle_ready_queue,
+        )
+        .expect("running uring");
     }
 
     fn get_next_op_id(&mut self) -> u64 {
@@ -134,14 +148,12 @@ impl ExecutorInner {
             } else {
                 None
             }
+        } else if let Some(res) = self.results.remove(&op) {
+            trace!("Removed op={op}");
+            self.op_to_task.remove(&op);
+            Some(res)
         } else {
-            if let Some(res) = self.results.remove(&op) {
-                trace!("Removed op={op}");
-                self.op_to_task.remove(&op);
-                Some(res)
-            } else {
-                None
-            }
+            None
         }
     }
 
@@ -160,109 +172,91 @@ impl ExecutorInner {
 }
 
 thread_local! {
-    static EXECUTOR: UnsafeCell<Option<ExecutorInner>> = UnsafeCell::new(None);
+    static EXECUTOR: UnsafeCell<Option<ExecutorInner>> = const { UnsafeCell::new(None) };
 }
 
 pub fn init() {
-    EXECUTOR.with(|exe| {
-        unsafe {
-            let exe = &mut *exe.get();
-            if exe.is_some() {
-                return;
-            }
-
-            let new_exe = ExecutorInner::new();
-            *exe = Some(new_exe);
+    EXECUTOR.with(|exe| unsafe {
+        let exe = &mut *exe.get();
+        if exe.is_some() {
+            return;
         }
+
+        let new_exe = ExecutorInner::new();
+        *exe = Some(new_exe);
     })
 }
 
 pub fn spawn(fut: impl Future<Output = ()> + 'static) {
-    EXECUTOR.with(|exe| {
-        unsafe {
-            let exe = &mut *exe.get();
-            exe.as_mut().unwrap().spawn(Box::pin(fut));
-        }
+    EXECUTOR.with(|exe| unsafe {
+        let exe = &mut *exe.get();
+        exe.as_mut().unwrap().spawn(Box::pin(fut));
     })
 }
 
 pub fn register_timer(ts: io_uring::types::Timespec) -> (u64, *const io_uring::types::Timespec) {
-    EXECUTOR.with(|exe| {
-        unsafe {
-            let exe = &mut *exe.get();
-            exe.as_mut().unwrap().register_timer(ts)
-        }
+    EXECUTOR.with(|exe| unsafe {
+        let exe = &mut *exe.get();
+        exe.as_mut().unwrap().register_timer(ts)
     })
 }
 
 pub fn unregister_timer(timer_id: u64) {
-    EXECUTOR.with(|exe| {
-        unsafe {
-            let exe = &mut *exe.get();
-            exe.as_mut().unwrap().unregister_timer(timer_id)
-        }
+    EXECUTOR.with(|exe| unsafe {
+        let exe = &mut *exe.get();
+        exe.as_mut().unwrap().unregister_timer(timer_id)
     })
 }
 
 pub fn handle_completion(op: u64, res: i32, flags: u32) -> Result<(), anyhow::Error> {
-    EXECUTOR.with(|exe| {
-        unsafe {
-            let exe = &mut *exe.get();
-            exe.as_mut().unwrap().handle_completion(op, res, flags)
-        }
+    EXECUTOR.with(|exe| unsafe {
+        let exe = &mut *exe.get();
+        exe.as_mut().unwrap().handle_completion(op, res, flags)
     })
 }
 
 pub fn handle_ready_queue() {
-    EXECUTOR.with(|exe| {
-        unsafe {
-            let exe = &mut *exe.get();
-            exe.as_mut().unwrap().handle_ready_queue()
-        }
+    EXECUTOR.with(|exe| unsafe {
+        let exe = &mut *exe.get();
+        exe.as_mut().unwrap().handle_ready_queue()
     })
 }
 
 pub fn get_next_op_id() -> u64 {
-    EXECUTOR.with(|exe| {
-        unsafe {
-            let exe = &mut *exe.get();
-            exe.as_mut().unwrap().get_next_op_id()
-        }
+    EXECUTOR.with(|exe| unsafe {
+        let exe = &mut *exe.get();
+        exe.as_mut().unwrap().get_next_op_id()
     })
 }
 
 pub fn get_result(op_id: u64) -> Option<i32> {
-    EXECUTOR.with(|exe| {
-        unsafe {
-            let exe = &mut *exe.get();
-            exe.as_mut().unwrap().get_result(op_id)
-        }
+    EXECUTOR.with(|exe| unsafe {
+        let exe = &mut *exe.get();
+        exe.as_mut().unwrap().get_result(op_id)
     })
 }
 
 pub fn schedule_completion(op_id: u64, is_multi: bool) {
-    EXECUTOR.with(|exe| {
-        unsafe {
-            let exe = &mut *exe.get();
-            exe.as_mut().unwrap().schedule_completion(op_id, is_multi)
-        }
+    EXECUTOR.with(|exe| unsafe {
+        let exe = &mut *exe.get();
+        exe.as_mut().unwrap().schedule_completion(op_id, is_multi)
     })
 }
 
 pub fn run() {
-    EXECUTOR.with(|exe| {
-        unsafe {
-            let exe = &mut *exe.get();
-            exe.as_mut().unwrap().run()
-        }
+    EXECUTOR.with(|exe| unsafe {
+        let exe = &mut *exe.get();
+        exe.as_mut().unwrap().run()
     })
 }
 
+#[cfg(test)]
 #[derive(Clone)]
 struct Executor {
     inner: Rc<UnsafeCell<ExecutorInner>>,
 }
 
+#[cfg(test)]
 impl Executor {
     pub fn new() -> Self {
         // If uring was already initialized this will be a no-op
@@ -308,11 +302,14 @@ impl Executor {
     }
 }
 
+#[cfg(test)]
 mod tests {
+    use super::Executor;
+    use std::cell::RefCell;
     use std::future::Future;
     use std::pin::Pin;
+    use std::rc::Rc;
     use std::task::{Context, Poll};
-    use super::Executor;
 
     struct ExampleFuture {
         id: u64,
@@ -328,7 +325,7 @@ mod tests {
                 Some(res) => {
                     println!("Got result {res}");
                     Poll::Ready(())
-                },
+                }
                 None => {
                     println!("no result yet");
                     Poll::Pending
@@ -340,26 +337,26 @@ mod tests {
     #[test]
     fn test1() {
         let mut executor = Executor::new();
-        let task_id = 1;
         let res = Rc::new(RefCell::new(false));
         let f = {
             let mut executor = executor.clone();
-            let task_id = task_id;
             let res = res.clone();
             async move {
                 let example_future_op = 7;
-                let fut = Box::pin(ExampleFuture { id: example_future_op, executor: executor.clone() });
-                executor.schedule_completion(example_future_op);
+                let fut = Box::pin(ExampleFuture {
+                    id: example_future_op,
+                    executor: executor.clone(),
+                });
+                executor.schedule_completion(example_future_op, false);
                 fut.await;
                 *res.borrow_mut() = true;
-                ()
             }
         };
         let id: u64 = 5;
-        executor.spawn(task_id, f);
-        executor.schedule_completion(id);
+        executor.spawn(f);
+        executor.schedule_completion(id, false);
         executor.handle_completion(5, 0, 0).expect("No error");
-        if let Ok(_) = executor.handle_completion(6, 0, 0) {
+        if executor.handle_completion(6, 0, 0).is_ok() {
             panic!("No scheduled completion 6");
         }
         executor.handle_completion(7, 0, 0).expect("No error");

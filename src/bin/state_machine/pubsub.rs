@@ -20,8 +20,9 @@ impl PubsubState {
     }
 
     pub fn subscribe(&mut self, channel: String, fd: RawFd) {
-        self.subscribers.entry(channel)
-            .or_insert_with(HashSet::new)
+        self.subscribers
+            .entry(channel)
+            .or_default()
             .insert(fd);
     }
 
@@ -33,7 +34,7 @@ impl PubsubState {
 
     pub fn get_subscribers(&self, channel: &String) -> HashSet<RawFd> {
         if !self.subscribers.contains_key(channel) {
-            return HashSet::new()
+            return HashSet::new();
         }
         self.subscribers.get(channel).unwrap().clone()
     }
@@ -50,9 +51,7 @@ impl Buffer {
             // Each subscriber has a reference to the buffer
             subscribers.insert(subscriber, BufferSubscriber::new(subscriber, buf.clone()));
         }
-        Buffer {
-            subscribers,
-        }
+        Buffer { subscribers }
     }
 
     pub fn get_sends(&mut self) -> Vec<Entry> {
@@ -65,12 +64,8 @@ impl Buffer {
 
     pub fn send(&mut self, fd: RawFd, n: usize) -> Option<Entry> {
         let s = self.subscribers.get_mut(&fd);
-        if s.is_none() {
-            return None;
-        }
 
-        let s = s.unwrap();
-        let entry = s.send(n);
+        let entry = s?.send(n);
         if entry.is_none() {
             self.subscribers.remove(&fd);
         }

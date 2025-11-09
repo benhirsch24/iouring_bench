@@ -1,16 +1,16 @@
-use clap::{Parser};
+use clap::Parser;
 use futures::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use log::{error, debug, info, trace, warn};
+use log::{debug, error, info, trace, warn};
 
-use std::collections::{HashMap};
-use std::{cell::RefCell, rc::Rc};
+use std::collections::HashMap;
 use std::os::fd::RawFd;
 use std::time::Duration;
+use std::{cell::RefCell, rc::Rc};
 
 use iouring_bench::executor;
-use iouring_bench::uring;
 use iouring_bench::net as unet;
 use iouring_bench::timeout::TimeoutFuture as Timeout;
+use iouring_bench::uring;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -34,7 +34,12 @@ struct SubscriberInfo {
     sent: u64,
 }
 
-async fn handle_publisher(mut reader: BufReader<unet::TcpStream>, mut writer: unet::TcpStream, channel: String, submap: Rc<RefCell<HashMap<String, SubscriberInfo>>>) {
+async fn handle_publisher(
+    mut reader: BufReader<unet::TcpStream>,
+    mut writer: unet::TcpStream,
+    channel: String,
+    submap: Rc<RefCell<HashMap<String, SubscriberInfo>>>,
+) {
     let task_id = executor::get_task_id();
     let fd = writer.as_raw_fd();
     debug!("Handling publisher channel={channel} fd={fd} task_id={task_id}");
@@ -50,7 +55,10 @@ async fn handle_publisher(mut reader: BufReader<unet::TcpStream>, mut writer: un
                     info!("Publisher left");
                     return;
                 }
-                debug!("Got message {} channel={channel} fd={fd} task_id={task_id}", line.replace("\n", "\\n").replace("\r", "\\r"));
+                debug!(
+                    "Got message {} channel={channel} fd={fd} task_id={task_id}",
+                    line.replace("\n", "\\n").replace("\r", "\\r")
+                );
                 // TODO: This is ugly af but it works
                 let streams = {
                     let mut streams = Vec::new();
@@ -70,31 +78,47 @@ async fn handle_publisher(mut reader: BufReader<unet::TcpStream>, mut writer: un
                         async move {
                             let task_id = executor::get_task_id();
                             if let Err(e) = s.write_all(line.as_bytes()).await {
-                                error!("Failed to write line to channel={channel} fd={} task_id={task_id}: {e}", s.as_raw_fd());
+                                error!(
+                                    "Failed to write line to channel={channel} fd={} task_id={task_id}: {e}",
+                                    s.as_raw_fd()
+                                );
                             }
                             submap.borrow_mut().get_mut(&channel).unwrap().sent += 1;
                         }
                     });
                 }
-            },
+            }
             Err(e) => {
                 error!("Got error {e}");
                 return;
-            },
+            }
         }
     }
 }
 
 // After reading the subscribe message and sending OK, this task just keeps the subscriber alive until it leaves.
 // The publisher is writing directly to the file descriptor which is shared by the shared map.
-async fn handle_subscriber(mut reader: BufReader<unet::TcpStream>, mut writer: unet::TcpStream, channel: String, submap: Rc<RefCell<HashMap<String, SubscriberInfo>>>) {
-    debug!("Handling subscriber channel={channel} fd={}", writer.as_raw_fd());
+async fn handle_subscriber(
+    mut reader: BufReader<unet::TcpStream>,
+    mut writer: unet::TcpStream,
+    channel: String,
+    submap: Rc<RefCell<HashMap<String, SubscriberInfo>>>,
+) {
+    debug!(
+        "Handling subscriber channel={channel} fd={}",
+        writer.as_raw_fd()
+    );
     let ok = b"OK\r\n";
     writer.write_all(ok).await.expect("OK");
 
     let new_stream_fd = writer.as_raw_fd();
     let new_stream = unet::TcpStream::new(writer.as_raw_fd());
-    let _ = submap.borrow_mut().entry(channel.clone()).or_insert(SubscriberInfo::default()).streams.insert(new_stream_fd, new_stream);
+    let _ = submap
+        .borrow_mut()
+        .entry(channel.clone())
+        .or_default()
+        .streams
+        .insert(new_stream_fd, new_stream);
 
     loop {
         let mut line = String::new();
@@ -102,14 +126,19 @@ async fn handle_subscriber(mut reader: BufReader<unet::TcpStream>, mut writer: u
             Ok(n) => {
                 if n == 0 {
                     debug!("Subscriber left");
-                    let _ = submap.borrow_mut().get_mut(&channel).unwrap().streams.remove(&new_stream_fd);
+                    let _ = submap
+                        .borrow_mut()
+                        .get_mut(&channel)
+                        .unwrap()
+                        .streams
+                        .remove(&new_stream_fd);
                     return;
                 }
-            },
+            }
             Err(e) => {
                 error!("Got error {e}");
                 return;
-            },
+            }
         }
     }
 }
@@ -118,7 +147,7 @@ fn main() -> anyhow::Result<()> {
     env_logger::init();
     let args = Args::parse();
 
-    uring::init(uring::UringArgs{
+    uring::init(uring::UringArgs {
         uring_size: args.uring_size,
         submissions_threshold: args.submissions_threshold,
         sqpoll_interval_ms: args.sqpoll_interval_ms,
@@ -127,7 +156,8 @@ fn main() -> anyhow::Result<()> {
     executor::init();
 
     // Map of channel name to subscriber info
-    let submap: Rc<RefCell<HashMap<String, SubscriberInfo>>> = Rc::new(RefCell::new(HashMap::new()));
+    let submap: Rc<RefCell<HashMap<String, SubscriberInfo>>> =
+        Rc::new(RefCell::new(HashMap::new()));
 
     // General metrics routine for uring, executor, application metrics every 5s
     executor::spawn({
@@ -166,7 +196,10 @@ fn main() -> anyhow::Result<()> {
                 let writer = unet::TcpStream::new(fd);
                 let mut reader = BufReader::new(stream);
                 let mut line = String::new();
-                trace!("Reading protocol line fd={fd} task_id={}", executor::get_task_id());
+                trace!(
+                    "Reading protocol line fd={fd} task_id={}",
+                    executor::get_task_id()
+                );
                 if let Err(e) = reader.read_line(&mut line).await {
                     error!("Failed to read line: {e}");
                     let mut stream = unet::TcpStream::new(fd);
@@ -181,7 +214,10 @@ fn main() -> anyhow::Result<()> {
                     let channel = line.trim()[10..].to_string();
                     handle_subscriber(reader, writer, channel, submap).await;
                 } else {
-                    warn!("Line had length {} but didn't start with expected protocol fd={fd}", line.len());
+                    warn!(
+                        "Line had length {} but didn't start with expected protocol fd={fd}",
+                        line.len()
+                    );
                 }
                 // TODO: Again, weird that I'm re-creating the tcp stream to close it but oh
                 // wellsies
@@ -192,7 +228,6 @@ fn main() -> anyhow::Result<()> {
                 debug!("Exiting task_id={task_id} fd={}", stream.as_raw_fd());
             });
         }
-        ()
     });
 
     executor::run();

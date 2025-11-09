@@ -17,7 +17,9 @@ pub struct TimeoutFuture {
 
 impl TimeoutFuture {
     pub fn new(dur: Duration, repeated: bool) -> Self {
-        let ts = types::Timespec::new().sec(dur.as_secs()).nsec(dur.subsec_nanos());
+        let ts = types::Timespec::new()
+            .sec(dur.as_secs())
+            .nsec(dur.subsec_nanos());
         let (timer_id, ts) = executor::register_timer(ts);
         let task_id = executor::get_task_id();
         let op_id = executor::get_next_op_id();
@@ -26,8 +28,11 @@ impl TimeoutFuture {
         } else {
             opcode::Timeout::new(ts)
         }
-        .build().user_data(op_id);
-        trace!("Scheduling timeout duration={dur:?} repeated={repeated} op={op_id} task_id={task_id}");
+        .build()
+        .user_data(op_id);
+        trace!(
+            "Scheduling timeout duration={dur:?} repeated={repeated} op={op_id} task_id={task_id}"
+        );
         executor::schedule_completion(op_id, repeated);
         uring::submit(timeout).expect("arm timeout");
         Self {
@@ -68,10 +73,8 @@ impl Future for TimeoutFuture {
                 } else {
                     Poll::Ready(Err(std::io::Error::from_raw_os_error(-res)))
                 }
-            },
-            None => {
-                Poll::Pending
             }
+            None => Poll::Pending,
         }
     }
 }

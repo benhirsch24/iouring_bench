@@ -1,12 +1,12 @@
 use bytes::{BufMut, Bytes, BytesMut};
-use clap::{Parser};
+use clap::Parser;
 use clap_duration::duration_range_value_parse;
 use duration_human::{DurationHuman, DurationHumanValidator};
 use io_uring::{opcode, types};
 use log::{debug, error, info, trace, warn};
 
-use std::collections::HashMap;
 use std::cell::{RefCell, UnsafeCell};
+use std::collections::HashMap;
 use std::io::Write;
 use std::net::TcpStream;
 use std::os::fd::{AsRawFd, RawFd};
@@ -31,7 +31,7 @@ impl CallbackRegistry {
 
     fn add_callback<T>(&mut self, f: T) -> u64
     where
-    T: FnOnce(i32) -> anyhow::Result<()> + 'static
+        T: FnOnce(i32) -> anyhow::Result<()> + 'static,
     {
         let c = self.counter;
         self.map.insert(c, Box::new(f));
@@ -43,7 +43,7 @@ impl CallbackRegistry {
         let cb = self.map.remove(&id);
         match cb {
             Some(cb) => cb(res),
-            None => anyhow::bail!("No callback registered for {id} res={res}")
+            None => anyhow::bail!("No callback registered for {id} res={res}"),
         }
     }
 }
@@ -53,37 +53,38 @@ thread_local! {
 }
 
 pub fn add_callback<F>(f: F) -> u64
-    where
-        F: FnOnce(i32) -> anyhow::Result<()> + 'static
+where
+    F: FnOnce(i32) -> anyhow::Result<()> + 'static,
 {
-    CB.with(|cbr| {
-        unsafe {
-            let cb_ref = &mut *cbr.get();
-            cb_ref.add_callback(Box::new(f))
-        }
+    CB.with(|cbr| unsafe {
+        let cb_ref = &mut *cbr.get();
+        cb_ref.add_callback(Box::new(f))
     })
 }
 
 pub fn call_back(id: u64, res: i32) -> anyhow::Result<()> {
-    CB.with(|cbr| {
-        unsafe {
-            let cb_ref = &mut *cbr.get();
-            cb_ref.call_back(id, res)
-        }
+    CB.with(|cbr| unsafe {
+        let cb_ref = &mut *cbr.get();
+        cb_ref.call_back(id, res)
     })
 }
 
 fn read_line(mut buf: BytesMut) -> Option<Bytes> {
     for idx in 0..buf.len() {
-        if buf[idx] == b'\n' && buf[idx-1] == b'\r' {
-            let b = buf.split_to(idx+1).freeze();
+        if buf[idx] == b'\n' && buf[idx - 1] == b'\r' {
+            let b = buf.split_to(idx + 1).freeze();
             return Some(b);
         }
     }
     None
 }
 
-fn read_message_recursive(fd: RawFd, done: Rc<RefCell<u32>>, end: std::time::Instant, msgn: u32) -> anyhow::Result<()> {
+fn read_message_recursive(
+    fd: RawFd,
+    done: Rc<RefCell<u32>>,
+    end: std::time::Instant,
+    msgn: u32,
+) -> anyhow::Result<()> {
     let mut read = BytesMut::with_capacity(1024);
     let ptr = read.as_mut_ptr();
     let op = opcode::Recv::new(types::Fd(fd), ptr, read.capacity() as u32);
@@ -94,7 +95,9 @@ fn read_message_recursive(fd: RawFd, done: Rc<RefCell<u32>>, end: std::time::Ins
         }
         trace!("Received message res={res}");
         unsafe { read.set_len(res.try_into()?) };
-        let line = read_line(read).ok_or(anyhow::anyhow!("No message received for subscriber={fd} {msgn}"))?;
+        let line = read_line(read).ok_or(anyhow::anyhow!(
+            "No message received for subscriber={fd} {msgn}"
+        ))?;
         let msg = std::str::from_utf8(line.as_ref())?;
         info!("Subscriber received message {msg} {msgn}");
 
@@ -103,22 +106,27 @@ fn read_message_recursive(fd: RawFd, done: Rc<RefCell<u32>>, end: std::time::Ins
             return Ok(());
         }
 
-        //if std::time::Instant::now() > end {
-        //    *done.borrow_mut() -= 1;
-        //    if *done.borrow() == 0 {
-        //        uring::exit();
-        //    }
-        //    return Ok(())
-        //}
+        if std::time::Instant::now() > end {
+            *done.borrow_mut() -= 1;
+            if *done.borrow() == 0 {
+                uring::exit();
+            }
+            return Ok(())
+        }
 
         // You lose cancellation but oh well for this example.
-        read_message_recursive(fd, done, end, msgn+1)
+        read_message_recursive(fd, done, end, msgn + 1)
     });
     uring::submit(op.build().user_data(ud))?;
     Ok(())
 }
 
-fn subscriber(channel: String, fd: RawFd, done: Rc<RefCell<u32>>, end: std::time::Instant) -> anyhow::Result<()> {
+fn subscriber(
+    channel: String,
+    fd: RawFd,
+    done: Rc<RefCell<u32>>,
+    end: std::time::Instant,
+) -> anyhow::Result<()> {
     let send_buffer = BytesMut::with_capacity(4096);
     let mut writer = send_buffer.writer();
     let msg = format!("SUBSCRIBE {channel}\r\n");
@@ -168,12 +176,12 @@ fn publish_recursive(fd: RawFd, end: std::time::Instant, pubn: u32) -> anyhow::R
         info!("Publisher sent message res={res} {pubn}");
 
         if std::time::Instant::now() > end {
-            return Ok(())
+            return Ok(());
         }
 
-        publish_recursive(fd, end, pubn+1)
+        publish_recursive(fd, end, pubn + 1)
     });
-    uring::submit(send_e.build().user_data(ud.into()))?;
+    uring::submit(send_e.build().user_data(ud))?;
     Ok(())
 }
 
@@ -201,9 +209,7 @@ fn publisher(channel: String, fd: RawFd, end: std::time::Instant) -> anyhow::Res
 
             debug!("Publisher OK recv={res}");
             let newlen: usize = read_buffer.len() + (res as usize);
-            unsafe {
-                read_buffer.set_len(newlen)
-            };
+            unsafe { read_buffer.set_len(newlen) };
             let line = read_line(read_buffer).expect("There should be one read by now");
             if line != "OK\r\n" {
                 anyhow::bail!("Expected OK");
@@ -212,7 +218,7 @@ fn publisher(channel: String, fd: RawFd, end: std::time::Instant) -> anyhow::Res
 
             publish_recursive(fd, end, 0)
         });
-        let e = read_e.build().user_data(ud).into();
+        let e = read_e.build().user_data(ud);
         uring::submit(e)?;
         Ok(())
     });
@@ -251,7 +257,7 @@ fn main() -> anyhow::Result<()> {
     env_logger::init();
     let args = Args::parse();
 
-    uring::init(uring::UringArgs{
+    uring::init(uring::UringArgs {
         uring_size: args.uring_size,
         submissions_threshold: args.submissions_threshold,
         sqpoll_interval_ms: args.sqpoll_interval_ms,
@@ -271,7 +277,9 @@ fn main() -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     let end = args.timeout + start;
     info!("going until {end:?}");
-    let done = Rc::new(RefCell::new(args.publishers * args.subscribers_per_publisher));
+    let done = Rc::new(RefCell::new(
+        args.publishers * args.subscribers_per_publisher,
+    ));
     for i in 0..args.publishers {
         // Set up subscribers first
         let channel = format!("Channel{i}");
@@ -292,25 +300,26 @@ fn main() -> anyhow::Result<()> {
         debug!("Publisher {}", fd);
     }
 
-    if let Err(e) = uring::run(move |ud, res, _flags| {
-        trace!("Got completion event ud={ud} res={res}");
-        match ud {
-            // Timeout
-            0 => {
-                if res != -62 {
-                    warn!("Timeout result not 62: {}", res);
-                }
+    if let Err(e) = uring::run(
+        move |ud, res, _flags| {
+            trace!("Got completion event ud={ud} res={res}");
+            match ud {
+                // Timeout
+                0 => {
+                    if res != -62 {
+                        warn!("Timeout result not 62: {}", res);
+                    }
 
-                let stats = uring::stats()?;
-                info!("Metrics: {}", stats);
-            },
-            // Callback registry
-            _ => {
-                call_back(ud, res)?
+                    let stats = uring::stats()?;
+                    info!("Metrics: {}", stats);
+                }
+                // Callback registry
+                _ => call_back(ud, res)?,
             }
-        }
-        Ok(())
-    }, || {}) {
+            Ok(())
+        },
+        || {},
+    ) {
         error!("Error running uring: {}", e);
     }
     info!("Exiting");

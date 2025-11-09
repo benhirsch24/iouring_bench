@@ -1,5 +1,5 @@
-use io_uring::{IoUring, squeue::Entry};
 use histogram::Histogram;
+use io_uring::{IoUring, squeue::Entry};
 use log::{error, trace};
 
 use std::cell::UnsafeCell;
@@ -22,19 +22,24 @@ impl Default for UringArgs {
 
 #[derive(Clone)]
 pub struct UringStats {
-        pub submitted_last_period: u64,
-        pub completions_last_period: u64,
-        pub submit_and_wait: u64,
-        pub to_submit_backlog: usize,
-        pub last_submit: std::time::Instant,
-        pub submit_and_wait_batch_size: Histogram,
+    pub submitted_last_period: u64,
+    pub completions_last_period: u64,
+    pub submit_and_wait: u64,
+    pub to_submit_backlog: usize,
+    pub last_submit: std::time::Instant,
+    pub submit_and_wait_batch_size: Histogram,
 }
 
 impl std::fmt::Display for UringStats {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "submitted_last_period={} completions_last_period={} submit_and_wait={} last_submit={}us",
-            self.submitted_last_period, self.completions_last_period, self.submit_and_wait,
-            self.last_submit.elapsed().as_micros())
+        write!(
+            f,
+            "submitted_last_period={} completions_last_period={} submit_and_wait={} last_submit={}us",
+            self.submitted_last_period,
+            self.completions_last_period,
+            self.submit_and_wait,
+            self.last_submit.elapsed().as_micros()
+        )
     }
 }
 
@@ -83,70 +88,63 @@ pub fn init(args: UringArgs) -> Result<(), std::io::Error> {
 }
 
 pub fn run<H, F>(handler: H, done: F) -> Result<(), anyhow::Error>
-    where
-        H: FnMut(u64, i32, u32) -> Result<(), anyhow::Error>,
-        F: Fn()
+where
+    H: FnMut(u64, i32, u32) -> Result<(), anyhow::Error>,
+    F: Fn(),
 {
-    URING.with(|uring| {
-        unsafe {
-            let uring_ref = &mut *uring.get();
-            let uring_mut = uring_ref.as_mut().unwrap();
-            uring_mut.run(handler, done)
-        }
+    URING.with(|uring| unsafe {
+        let uring_ref = &mut *uring.get();
+        let uring_mut = uring_ref.as_mut().unwrap();
+        uring_mut.run(handler, done)
     })?;
     Ok(())
 }
 
 pub fn submit(sqe: Entry) -> Result<(), std::io::Error> {
-    URING.with(|uring| {
-        unsafe {
-            let uring_ref = &mut *uring.get();
-            match uring_ref.as_mut() {
-                Some(u) => u.submit(sqe),
-                None => panic!("uring not initialized")
-            }
+    URING.with(|uring| unsafe {
+        let uring_ref = &mut *uring.get();
+        match uring_ref.as_mut() {
+            Some(u) => u.submit(sqe),
+            None => panic!("uring not initialized"),
         }
     });
     Ok(())
 }
 
 pub fn exit() {
-    URING.with(|uring| {
-        unsafe {
-            let uring_ref = &mut *uring.get();
-            match uring_ref.as_mut() {
-                Some(u) => u.exit(),
-                None => panic!("uring not initialized")
-            }
+    URING.with(|uring| unsafe {
+        let uring_ref = &mut *uring.get();
+        match uring_ref.as_mut() {
+            Some(u) => u.exit(),
+            None => panic!("uring not initialized"),
         }
     });
 }
 
 pub fn stats() -> Result<UringStats, std::io::Error> {
-    URING.with(|uring| {
-        unsafe {
-            let uring_ref = &mut *uring.get();
-            let uring_mut = uring_ref.as_mut().unwrap();
-            let mut stats = uring_mut.stats.clone();
-            stats.to_submit_backlog = uring_mut.to_submit.len();
-            uring_mut.stats = UringStats::new();
-            Ok(stats)
-        }
+    URING.with(|uring| unsafe {
+        let uring_ref = &mut *uring.get();
+        let uring_mut = uring_ref.as_mut().unwrap();
+        let mut stats = uring_mut.stats.clone();
+        stats.to_submit_backlog = uring_mut.to_submit.len();
+        uring_mut.stats = UringStats::new();
+        Ok(stats)
     })
 }
 
 impl Uring {
     fn new(args: UringArgs) -> Result<Uring, std::io::Error> {
-        let uring: IoUring<io_uring::squeue::Entry, io_uring::cqueue::Entry> = if args.sqpoll_interval_ms > 0 {
-            IoUring::builder()
-                .setup_cqsize(args.uring_size*2)
-                .setup_sqpoll(args.sqpoll_interval_ms)
-                .build(args.uring_size)?
-        } else {
-            IoUring::builder()
-                .setup_cqsize(args.uring_size*2)
-                .build(args.uring_size)?
-        };
+        let uring: IoUring<io_uring::squeue::Entry, io_uring::cqueue::Entry> =
+            if args.sqpoll_interval_ms > 0 {
+                IoUring::builder()
+                    .setup_cqsize(args.uring_size * 2)
+                    .setup_sqpoll(args.sqpoll_interval_ms)
+                    .build(args.uring_size)?
+            } else {
+                IoUring::builder()
+                    .setup_cqsize(args.uring_size * 2)
+                    .build(args.uring_size)?
+            };
         Ok(Uring {
             uring,
             args,
@@ -160,7 +158,11 @@ impl Uring {
         self.done = true;
     }
 
-    fn run<H, F>(&mut self, mut completion_handler: H, completions_done_handler: F) -> Result<(), anyhow::Error>
+    fn run<H, F>(
+        &mut self,
+        mut completion_handler: H,
+        completions_done_handler: F,
+    ) -> Result<(), anyhow::Error>
     where
         H: FnMut(u64, i32, u32) -> Result<(), anyhow::Error>,
         F: Fn(),
@@ -179,7 +181,11 @@ impl Uring {
                 completed += 1;
                 trace!("completion result={} op={}", e.result(), e.user_data());
                 if let Err(err) = completion_handler(e.user_data(), e.result(), e.flags()) {
-                    error!("Error handling cqe (op={} res={}): {err}", e.user_data(), e.result());
+                    error!(
+                        "Error handling cqe (op={} res={}): {err}",
+                        e.user_data(),
+                        e.result()
+                    );
                 }
             }
             completions_done_handler();
@@ -187,7 +193,10 @@ impl Uring {
             // Submit N batches of size threshold
             let num_batches = self.to_submit.len() / self.args.submissions_threshold;
             for _ in 0..num_batches {
-                let batch: Vec<io_uring::squeue::Entry> = self.to_submit.drain(0..self.args.submissions_threshold).collect();
+                let batch: Vec<io_uring::squeue::Entry> = self
+                    .to_submit
+                    .drain(0..self.args.submissions_threshold)
+                    .collect();
                 unsafe { self.uring.submission().push_multiple(&batch) }.expect("push multiple");
                 self.uring.submit().expect("Submitted");
                 self.stats.last_submit = std::time::Instant::now();
@@ -198,12 +207,23 @@ impl Uring {
             // 1. We're in SQPOLL mode and we haven't submitted in over the interval, so the kernel
             //    thread may have returned.
             // 2. We haven't submitted in some period of time because we haven't hit the batch threshold
-            let should_sqpoll_submit = self.args.sqpoll_interval_ms > 0 && self.stats.last_submit.elapsed().as_millis() > self.args.sqpoll_interval_ms.into();
+            let should_sqpoll_submit = self.args.sqpoll_interval_ms > 0
+                && self.stats.last_submit.elapsed().as_millis()
+                    > self.args.sqpoll_interval_ms.into();
             if should_sqpoll_submit || completed == 0 {
                 let batch: Vec<io_uring::squeue::Entry> = self.to_submit.drain(..).collect();
                 unsafe { self.uring.submission().push_multiple(&batch) }.expect("push multiple");
-                trace!("Submit and wait last_submit={} backlog={} batch_size={} t_diff={}", self.stats.last_submit.elapsed().as_millis(), self.to_submit.len(), batch.len(), self.stats.last_submit.elapsed().as_micros());
-                self.stats.submit_and_wait_batch_size.increment(batch.len() as u64).unwrap();
+                trace!(
+                    "Submit and wait last_submit={} backlog={} batch_size={} t_diff={}",
+                    self.stats.last_submit.elapsed().as_millis(),
+                    self.to_submit.len(),
+                    batch.len(),
+                    self.stats.last_submit.elapsed().as_micros()
+                );
+                self.stats
+                    .submit_and_wait_batch_size
+                    .increment(batch.len() as u64)
+                    .unwrap();
                 self.stats.submit_and_wait += 1;
                 self.stats.last_submit = std::time::Instant::now();
                 self.uring.submit_and_wait(1)?;
