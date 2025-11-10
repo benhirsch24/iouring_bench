@@ -1,3 +1,4 @@
+use anyhow::Context;
 use clap::Parser;
 use clap_duration::duration_range_value_parse;
 use duration_human::{DurationHuman, DurationHumanValidator};
@@ -6,11 +7,14 @@ use log::{debug, error, info, trace};
 use rand::Rng;
 
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::io::Result;
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{cell::RefCell, rc::Rc};
 
 use iouring_bench::executor;
+use iouring_bench::file::File;
 use iouring_bench::net as unet;
 use iouring_bench::timeout::TimeoutFuture as Timeout;
 use iouring_bench::uring;
@@ -50,6 +54,10 @@ struct Args {
 
     #[arg(short = 'b', long, default_value_t = 8192)]
     message_size: usize,
+
+    /// Path where JSONL stats should be written
+    #[arg(long, default_value = "/tmp/pubsub_client_stats.jsonl")]
+    stats_output: PathBuf,
 }
 
 #[derive(Clone)]
@@ -68,6 +76,10 @@ impl Stats {
         let mut m = self.writes.borrow_mut();
         *m.entry(channel.to_string()).or_insert(0) += 1;
     }
+
+    fn total_writes(&self) -> u64 {
+        self.writes.borrow().values().sum()
+    }
 }
 
 impl std::fmt::Display for Stats {
@@ -80,6 +92,33 @@ impl std::fmt::Display for Stats {
         write!(f, "total={total}")?;
         Ok(())
     }
+}
+
+async fn persist_total_messages_jsonl(stats: Stats, path: PathBuf, end: Instant) -> Result<()> {
+    let mut file = File::open(&path)?.await?;
+    loop {
+        let now = Instant::now();
+        if now >= end {
+            break;
+        }
+        let remaining = end - now;
+        let wait = if remaining > Duration::from_secs(5) {
+            Duration::from_secs(5)
+        } else {
+            remaining
+        };
+        Timeout::new(wait, false).await?;
+        let total = stats.total_writes();
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let line = format!("{{\"timestamp_ms\":{timestamp_ms},\"total_messages\":{total}}}\n");
+        file.write_all(line.as_bytes()).await?;
+        file.flush().await?;
+    }
+    file.close().await?;
+    Ok(())
 }
 
 struct Publisher {
@@ -210,6 +249,12 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+    OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&args.stats_output)
+        .with_context(|| format!("creating {}", args.stats_output.display()))?;
 
     uring::init(uring::UringArgs {
         uring_size: args.uring_size,
@@ -241,6 +286,15 @@ fn main() -> anyhow::Result<()> {
 
     let start = std::time::Instant::now();
     let end = args.timeout + start;
+    executor::spawn({
+        let stats = stats.clone();
+        let stats_path = args.stats_output.clone();
+        async move {
+            if let Err(e) = persist_total_messages_jsonl(stats, stats_path, end).await {
+                error!("Failed to persist stats JSONL: {e}");
+            }
+        }
+    });
 
     let mut rng = rand::rng();
     for n in 0..args.publishers {
