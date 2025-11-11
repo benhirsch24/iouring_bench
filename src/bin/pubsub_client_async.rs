@@ -17,6 +17,7 @@ use iouring_bench::executor;
 use iouring_bench::file::File;
 use iouring_bench::net as unet;
 use iouring_bench::timeout::TimeoutFuture as Timeout;
+use iouring_bench::sync::wg::WaitGroup;
 use iouring_bench::uring;
 
 #[derive(Parser, Debug)]
@@ -136,7 +137,6 @@ impl Publisher {
         let message_body = format!("{}_{}", channel, message_base.repeat(repeated));
         let slice_end = message_size.min(message_body.len());
         let message = format!("{}\r\n", &message_body[..slice_end]);
-        println!("{}", message.len());
 
         Self {
             tps,
@@ -297,6 +297,7 @@ fn main() -> anyhow::Result<()> {
     });
 
     let mut rng = rand::rng();
+    let mut wg = WaitGroup::new();
     for n in 0..args.publishers {
         let channel_name = format!("Channel_{n}");
         // Add some jitter here for ramp up
@@ -304,12 +305,14 @@ fn main() -> anyhow::Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(jitter_ms));
 
         // Spawn a publisher
+        let g = wg.add();
         executor::spawn({
             let channel_name = channel_name.clone();
             let endpoint = args.endpoint.clone();
             let stats = stats.clone();
             debug!("Starting publisher for {channel_name}");
             async move {
+                let _g = g;
                 let mut publisher = Publisher::new(
                     args.tps,
                     endpoint,
@@ -337,6 +340,12 @@ fn main() -> anyhow::Result<()> {
             });
         }
     }
+
+    executor::spawn(async move {
+        wg.wait().await;
+        info!("Publishers are all done, exiting");
+        uring::exit();
+    });
 
     executor::run();
 

@@ -1,20 +1,20 @@
 use std::cell::{Cell, UnsafeCell};
 use std::collections::HashMap;
 use std::future::Future;
-use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
+
+use futures::future::{LocalBoxFuture, FutureExt};
+use log::{trace, warn};
 
 #[cfg(test)]
 use std::rc::Rc;
 
 use crate::uring;
 
-use log::{trace, warn};
-
-struct ExecutorInner {
+struct ExecutorInner<'a> {
     results: HashMap<u64, i32>,
     multi_results: HashMap<u64, Vec<i32>>,
-    tasks: HashMap<u64, Pin<Box<dyn Future<Output = ()>>>>,
+    tasks: HashMap<u64, LocalBoxFuture<'a, ()>>,
     op_to_task: HashMap<u64, (u64, bool)>,
     next_task_id: u64,
     next_op_id: u64,
@@ -36,7 +36,7 @@ fn set_task_id(new_task_id: u64) {
     TASK_ID.set(new_task_id)
 }
 
-impl ExecutorInner {
+impl ExecutorInner<'_> {
     pub fn new() -> Self {
         Self {
             results: HashMap::new(),
@@ -75,7 +75,7 @@ impl ExecutorInner {
 
         let (task_id, is_multi) = self.op_to_task.get(&op).copied().unwrap();
         trace!("handle_completion op={op} res={res} task_id={task_id} is_multi={is_multi}");
-        self.ready_queue.push(task_id);
+        self.wake(task_id);
         if !is_multi {
             self.results.insert(op, res);
         } else {
@@ -85,34 +85,46 @@ impl ExecutorInner {
     }
 
     fn handle_ready_queue(&mut self) {
-        let start = std::time::Instant::now();
-        trace!(
-            "Ready queue len {}: {:?}",
-            self.ready_queue.len(),
-            self.ready_queue
-        );
-        let ready_queue = std::mem::take(&mut self.ready_queue);
-        for task_id in ready_queue.iter() {
-            set_task_id(*task_id);
-            trace!("Set task_id={task_id}");
-            if let Some(mut task) = self.tasks.remove(task_id) {
-                let start = std::time::Instant::now();
-                let mut ctx = Context::from_waker(Waker::noop());
-                match task.as_mut().poll(&mut ctx) {
-                    Poll::Ready(_) => {
-                        trace!("Task complete in {:?} task_id={task_id}", start.elapsed());
-                    }
-                    Poll::Pending => {
-                        trace!(
-                            "Task still pending in {:?} task_id={task_id}",
-                            start.elapsed()
-                        );
-                        self.tasks.insert(*task_id, task);
+        // Handle tasks in the ready queue until there's no more.
+        // This is because tasks may depend on other tasks finishing without IO being involved.
+        // Otherwise we have to wait for IO to come back from uring.
+        let mut n = 0;
+        loop {
+            trace!("Ready queue n={n}");
+            n += 1;
+            if self.ready_queue.len() == 0 {
+                trace!("No more ready queue");
+                return;
+            }
+            let start = std::time::Instant::now();
+            trace!(
+                "Ready queue len {}: {:?}",
+                self.ready_queue.len(),
+                self.ready_queue
+            );
+            let ready_queue = std::mem::take(&mut self.ready_queue);
+            for task_id in ready_queue.iter() {
+                set_task_id(*task_id);
+                trace!("Set task_id={task_id}");
+                if let Some(mut task) = self.tasks.remove(task_id) {
+                    let start = std::time::Instant::now();
+                    let mut ctx = Context::from_waker(Waker::noop());
+                    match task.as_mut().poll(&mut ctx) {
+                        Poll::Ready(_) => {
+                            trace!("Task complete in {:?} task_id={task_id}", start.elapsed());
+                        }
+                        Poll::Pending => {
+                            trace!(
+                                "Task still pending in {:?} task_id={task_id}",
+                                start.elapsed()
+                            );
+                            self.tasks.insert(*task_id, task);
+                        }
                     }
                 }
             }
+            trace!("Ready queue handled in {:?}, tasks len={}", start.elapsed(), self.tasks.len());
         }
-        trace!("Ready queue handled in {:?}", start.elapsed());
     }
 
     pub fn run(&mut self) {
@@ -156,14 +168,20 @@ impl ExecutorInner {
     fn spawn(&mut self, fut: impl Future<Output = ()> + 'static) {
         let cur_task = get_task_id();
         let task_id = self.get_next_task_id();
-        trace!("Spawning new task task_id={task_id} cur_task={cur_task}");
-        self.tasks.insert(task_id, Box::pin(fut));
+        self.tasks.insert(task_id, fut.fuse().boxed_local());
+        self.ready_queue.push(task_id);
+        trace!("Spawning new task task_id={task_id} cur_task={cur_task} rq={}", self.ready_queue.len());
+    }
+
+    fn wake(&mut self, task_id: u64) {
+        trace!("Waking task_id={task_id}");
         self.ready_queue.push(task_id);
     }
 
     fn schedule_completion(&mut self, op: u64, is_multi: bool) {
         let task_id = get_task_id();
         self.op_to_task.insert(op, (task_id, is_multi));
+        trace!("scheduled completion op_id={op} task_id={task_id}");
     }
 }
 
@@ -186,7 +204,7 @@ pub fn init() {
 pub fn spawn(fut: impl Future<Output = ()> + 'static) {
     EXECUTOR.with(|exe| unsafe {
         let exe = &mut *exe.get();
-        exe.as_mut().unwrap().spawn(Box::pin(fut));
+        exe.as_mut().unwrap().spawn(fut);
     })
 }
 
@@ -236,6 +254,13 @@ pub fn schedule_completion(op_id: u64, is_multi: bool) {
     EXECUTOR.with(|exe| unsafe {
         let exe = &mut *exe.get();
         exe.as_mut().unwrap().schedule_completion(op_id, is_multi)
+    })
+}
+
+pub fn wake(task_id: u64) {
+    EXECUTOR.with(|exe| unsafe {
+        let exe = &mut *exe.get();
+        exe.as_mut().unwrap().wake(task_id)
     })
 }
 

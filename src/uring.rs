@@ -168,10 +168,6 @@ impl Uring {
         F: Fn(),
     {
         loop {
-            if self.done {
-                break;
-            }
-
             let mut completed = 0;
 
             // Check for completions
@@ -189,6 +185,10 @@ impl Uring {
                 }
             }
             completions_done_handler();
+
+            if self.done {
+                break;
+            }
 
             // Submit N batches of size threshold
             let num_batches = self.to_submit.len() / self.args.submissions_threshold;
