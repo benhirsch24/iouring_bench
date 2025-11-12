@@ -88,6 +88,8 @@ impl ExecutorInner<'_> {
         // Handle tasks in the ready queue until there's no more.
         // This is because tasks may depend on other tasks finishing without IO being involved.
         // Otherwise we have to wait for IO to come back from uring.
+        // In a production library we'd want to have a maximum number of loops or some sort of
+        // budget for how long we spend here before yielding back and seeing if any IO is done.
         let mut n = 0;
         loop {
             trace!("Ready queue n={n}");
