@@ -321,17 +321,6 @@ fn main() -> anyhow::Result<()> {
     let stats = Stats::new();
     let subscriber_stats = SubscriberStats::new();
     executor::spawn({
-        let stats = stats.clone();
-        let log_deadline = end + Duration::from_millis(25);
-        async move {
-            let now = Instant::now();
-            if log_deadline > now {
-                let _ = Timeout::new(log_deadline - now, false).await;
-            }
-            info!("Stats: {}", stats);
-        }
-    });
-    executor::spawn({
         let subscriber_stats = subscriber_stats.clone();
         let log_deadline = end + Duration::from_millis(25);
         async move {
@@ -339,7 +328,6 @@ fn main() -> anyhow::Result<()> {
             if log_deadline > now {
                 let _ = Timeout::new(log_deadline - now, false).await;
             }
-            info!("Subscriber stats: {}", subscriber_stats);
         }
     });
 
@@ -418,6 +406,8 @@ fn main() -> anyhow::Result<()> {
     });
 
     executor::run();
+
+    info!("Subscriber stats: {}", subscriber_stats);
 
     Ok(())
 }

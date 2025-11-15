@@ -2,9 +2,7 @@ use clap::Parser;
 use futures::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use log::{debug, error, info, trace, warn};
 
-use std::cell::Cell;
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::os::fd::RawFd;
 use std::time::Duration;
 use std::{cell::RefCell, rc::Rc};
@@ -36,14 +34,6 @@ struct Args {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct ChannelId(u32);
 
-impl ChannelId {
-    fn allocate(generator: &Rc<Cell<u32>>) -> Self {
-        let next = generator.get();
-        generator.set(next + 1);
-        ChannelId(next)
-    }
-}
-
 struct SubscriberInfo {
     id: ChannelId,
     senders: HashMap<RawFd, mpsc::Sender<Rc<String>>>,
@@ -62,27 +52,154 @@ struct ChannelStats {
     active: bool,
 }
 
-fn remove_subscriber(
-    submap: &Rc<RefCell<HashMap<String, SubscriberInfo>>>,
-    channel: &str,
-    subscriber_fd: RawFd,
-    stats_tx: &mut mpsc::Sender<StatEvent>,
-) {
-    let mut map = submap.borrow_mut();
-    let remove_channel = match map.get_mut(channel) {
-        Some(info) => {
-            info.senders.remove(&subscriber_fd);
-            if info.senders.is_empty() {
-                Some(info.id)
-            } else {
-                None
-            }
+#[derive(Clone)]
+struct Subscribers {
+    inner: Rc<RefCell<SubscribersInner>>,
+}
+
+struct SubscribersInner {
+    next_channel_id: u32,
+    channels: HashMap<String, SubscriberInfo>,
+}
+
+impl Subscribers {
+    fn new() -> Self {
+        Subscribers {
+            inner: Rc::new(RefCell::new(SubscribersInner {
+                next_channel_id: 0,
+                channels: HashMap::new(),
+            })),
         }
-        None => None,
-    };
-    if let Some(channel_id) = remove_channel {
-        map.remove(channel);
-        let _ = stats_tx.send(StatEvent::ChannelRemoved { channel_id });
+    }
+
+    fn senders_for(&self, channel: &str) -> Vec<mpsc::Sender<Rc<String>>> {
+        if let Some(info) = self.inner.borrow().channels.get(channel) {
+            info.senders.values().cloned().collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn channel_id(&self, channel: &str) -> Option<ChannelId> {
+        self.inner
+            .borrow()
+            .channels
+            .get(channel)
+            .map(|info| info.id)
+    }
+
+    fn add_subscriber(
+        &self,
+        channel: &str,
+        subscriber_fd: RawFd,
+        sender: mpsc::Sender<Rc<String>>,
+    ) -> Option<ChannelId> {
+        let mut inner = self.inner.borrow_mut();
+        if let Some(info) = inner.channels.get_mut(channel) {
+            info.senders.insert(subscriber_fd, sender);
+            None
+        } else {
+            let channel_id = ChannelId(inner.next_channel_id);
+            inner.next_channel_id += 1;
+            let mut info = SubscriberInfo {
+                id: channel_id,
+                senders: HashMap::new(),
+            };
+            info.senders.insert(subscriber_fd, sender);
+            inner.channels.insert(channel.to_string(), info);
+            Some(channel_id)
+        }
+    }
+
+    fn remove_subscriber(&self, channel: &str, subscriber_fd: RawFd) -> Option<ChannelId> {
+        let mut inner = self.inner.borrow_mut();
+        let remove_channel = match inner.channels.get_mut(channel) {
+            Some(info) => {
+                info.senders.remove(&subscriber_fd);
+                if info.senders.is_empty() {
+                    Some(info.id)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+        if let Some(channel_id) = remove_channel {
+            inner.channels.remove(channel);
+            Some(channel_id)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ChannelStatsStore {
+    inner: Rc<RefCell<ChannelStatsStoreInner>>,
+}
+
+struct ChannelStatsStoreInner {
+    stats: HashMap<ChannelId, ChannelStats>,
+}
+
+#[derive(Clone)]
+struct ChannelStatsSnapshot {
+    name: String,
+    sent: u64,
+    active: bool,
+}
+
+impl ChannelStatsStore {
+    fn new() -> Self {
+        ChannelStatsStore {
+            inner: Rc::new(RefCell::new(ChannelStatsStoreInner {
+                stats: HashMap::new(),
+            })),
+        }
+    }
+
+    fn record_registration(&self, channel_id: ChannelId, name: String) {
+        self.inner.borrow_mut().stats.insert(
+            channel_id,
+            ChannelStats {
+                name,
+                sent: 0,
+                active: true,
+            },
+        );
+    }
+
+    fn mark_inactive(&self, channel_id: ChannelId) {
+        if let Some(entry) = self.inner.borrow_mut().stats.get_mut(&channel_id) {
+            entry.active = false;
+        }
+    }
+
+    fn add_messages(&self, channel_id: ChannelId, count: u64) {
+        if let Some(entry) = self.inner.borrow_mut().stats.get_mut(&channel_id) {
+            entry.sent += count;
+        }
+    }
+
+    fn collect_and_reset(&self) -> Vec<(ChannelId, ChannelStatsSnapshot)> {
+        let mut inner = self.inner.borrow_mut();
+        inner
+            .stats
+            .iter_mut()
+            .map(|(channel_id, entry)| {
+                let snapshot = ChannelStatsSnapshot {
+                    name: entry.name.clone(),
+                    sent: entry.sent,
+                    active: entry.active,
+                };
+                entry.sent = 0;
+                (*channel_id, snapshot)
+            })
+            .collect()
+    }
+
+    fn remove(&self, channel_id: ChannelId) {
+        self.inner.borrow_mut().stats.remove(&channel_id);
     }
 }
 
@@ -90,7 +207,7 @@ async fn handle_publisher(
     mut reader: BufReader<unet::TcpStream>,
     mut writer: unet::TcpStream,
     channel: String,
-    submap: Rc<RefCell<HashMap<String, SubscriberInfo>>>,
+    subscribers: Subscribers,
     mut stats_tx: mpsc::Sender<StatEvent>,
 ) {
     let task_id = executor::get_task_id();
@@ -111,15 +228,7 @@ async fn handle_publisher(
                     "Got message {} channel={channel} fd={fd} task_id={task_id}",
                     line.replace("\n", "\\n").replace("\r", "\\r")
                 );
-                let senders = {
-                    let mut senders = Vec::new();
-                    if let Some(set) = submap.borrow().get(&channel) {
-                        for sender in set.senders.values() {
-                            senders.push(sender.clone());
-                        }
-                    }
-                    senders
-                };
+                let senders = subscribers.senders_for(&channel);
                 let payload = Rc::new(line.clone());
                 let mut delivered = 0u64;
                 for mut sender in senders {
@@ -132,9 +241,9 @@ async fn handle_publisher(
                     }
                 }
                 if delivered > 0 {
-                    if let Some(info) = submap.borrow().get(&channel) {
+                    if let Some(channel_id) = subscribers.channel_id(&channel) {
                         let _ = stats_tx.send(StatEvent::MessagesSent {
-                            channel_id: info.id,
+                            channel_id,
                             count: delivered,
                         });
                     }
@@ -152,8 +261,7 @@ async fn handle_subscriber(
     mut reader: BufReader<unet::TcpStream>,
     mut writer: unet::TcpStream,
     channel: String,
-    submap: Rc<RefCell<HashMap<String, SubscriberInfo>>>,
-    channel_ids: Rc<Cell<u32>>,
+    subscribers: Subscribers,
     mut stats_tx: mpsc::Sender<StatEvent>,
 ) {
     debug!(
@@ -165,27 +273,11 @@ async fn handle_subscriber(
     let subscriber_fd = writer.as_raw_fd();
     let (rx_inner, tx) = mpsc::channel::<Rc<String>>();
     let rx = Rc::new(RefCell::new(rx_inner));
-    {
-        let mut map = submap.borrow_mut();
-        match map.entry(channel.clone()) {
-            Entry::Occupied(mut entry) => {
-                entry.get_mut().senders.insert(subscriber_fd, tx);
-            }
-            Entry::Vacant(entry) => {
-                let channel_id = ChannelId::allocate(&channel_ids);
-                entry
-                    .insert(SubscriberInfo {
-                        id: channel_id,
-                        senders: HashMap::new(),
-                    })
-                    .senders
-                    .insert(subscriber_fd, tx);
-                let _ = stats_tx.send(StatEvent::ChannelRegistered {
-                    channel_id,
-                    name: channel.clone(),
-                });
-            }
-        }
+    if let Some(channel_id) = subscribers.add_subscriber(&channel, subscriber_fd, tx) {
+        let _ = stats_tx.send(StatEvent::ChannelRegistered {
+            channel_id,
+            name: channel.clone(),
+        });
     }
 
     executor::spawn({
@@ -224,14 +316,19 @@ async fn handle_subscriber(
             Ok(n) => {
                 if n == 0 {
                     debug!("Subscriber left");
-                    remove_subscriber(&submap, &channel, subscriber_fd, &mut stats_tx);
+                    if let Some(channel_id) = subscribers.remove_subscriber(&channel, subscriber_fd)
+                    {
+                        let _ = stats_tx.send(StatEvent::ChannelRemoved { channel_id });
+                    }
                     rx.borrow_mut().close();
                     return;
                 }
             }
             Err(e) => {
                 error!("Got error {e}");
-                remove_subscriber(&submap, &channel, subscriber_fd, &mut stats_tx);
+                if let Some(channel_id) = subscribers.remove_subscriber(&channel, subscriber_fd) {
+                    let _ = stats_tx.send(StatEvent::ChannelRemoved { channel_id });
+                }
                 rx.borrow_mut().close();
                 return;
             }
@@ -251,13 +348,8 @@ fn main() -> anyhow::Result<()> {
 
     executor::init();
 
-    // Map of channel name to subscriber info
-    let submap: Rc<RefCell<HashMap<String, SubscriberInfo>>> =
-        Rc::new(RefCell::new(HashMap::new()));
-    let channel_ids = Rc::new(Cell::new(0u32));
-
-    let stats_map: Rc<RefCell<HashMap<ChannelId, ChannelStats>>> =
-        Rc::new(RefCell::new(HashMap::new()));
+    let subscribers = Subscribers::new();
+    let stats_map = ChannelStatsStore::new();
     let (stats_rx, stats_tx) = mpsc::channel::<StatEvent>();
 
     executor::spawn({
@@ -267,24 +359,13 @@ fn main() -> anyhow::Result<()> {
             loop {
                 match stats_rx.recv().await {
                     Some(StatEvent::ChannelRegistered { channel_id, name }) => {
-                        stats_map.borrow_mut().insert(
-                            channel_id,
-                            ChannelStats {
-                                name,
-                                sent: 0,
-                                active: true,
-                            },
-                        );
+                        stats_map.record_registration(channel_id, name);
                     }
                     Some(StatEvent::ChannelRemoved { channel_id }) => {
-                        if let Some(entry) = stats_map.borrow_mut().get_mut(&channel_id) {
-                            entry.active = false;
-                        }
+                        stats_map.mark_inactive(channel_id);
                     }
                     Some(StatEvent::MessagesSent { channel_id, count }) => {
-                        if let Some(entry) = stats_map.borrow_mut().get_mut(&channel_id) {
-                            entry.sent += count;
-                        }
+                        stats_map.add_messages(channel_id, count);
                     }
                     None => break,
                 }
@@ -304,23 +385,17 @@ fn main() -> anyhow::Result<()> {
 
                 // Print number of messages sent per subscriber so far
                 let mut to_remove = Vec::new();
-                {
-                    let mut map = stats_map.borrow_mut();
-                    for (channel_id, entry) in map.iter_mut() {
-                        if entry.active || entry.sent > 0 {
-                            info!("{} sent {}", entry.name, entry.sent);
-                        }
-                        let remove_entry = !entry.active && entry.sent == 0;
-                        entry.sent = 0;
-                        if remove_entry {
-                            to_remove.push(*channel_id);
-                        }
+                for (channel_id, snapshot) in stats_map.collect_and_reset() {
+                    if snapshot.active || snapshot.sent > 0 {
+                        info!("{} sent {}", snapshot.name, snapshot.sent);
+                    }
+                    if !snapshot.active && snapshot.sent == 0 {
+                        to_remove.push(channel_id);
                     }
                 }
                 if !to_remove.is_empty() {
-                    let mut map = stats_map.borrow_mut();
                     for channel_id in to_remove {
-                        map.remove(&channel_id);
+                        stats_map.remove(channel_id);
                     }
                 }
             }
@@ -332,8 +407,7 @@ fn main() -> anyhow::Result<()> {
         loop {
             debug!("Accepting");
             let stream = listener.accept_multi_fut().unwrap().await.unwrap();
-            let submap = submap.clone();
-            let channel_ids = channel_ids.clone();
+            let subscriber_map = subscribers.clone();
             let stats_tx = stats_tx.clone();
             executor::spawn(async move {
                 let task_id = executor::get_task_id();
@@ -358,10 +432,11 @@ fn main() -> anyhow::Result<()> {
                 trace!("Read protocol {line}");
                 if line.starts_with("PUBLISH") {
                     let channel = line.trim()[8..].to_string();
-                    handle_publisher(reader, writer, channel, submap, stats_tx).await;
+                    handle_publisher(reader, writer, channel, subscriber_map.clone(), stats_tx)
+                        .await;
                 } else if line.starts_with("SUBSCRIBE") {
                     let channel = line.trim()[10..].to_string();
-                    handle_subscriber(reader, writer, channel, submap, channel_ids, stats_tx).await;
+                    handle_subscriber(reader, writer, channel, subscriber_map, stats_tx).await;
                 } else {
                     warn!(
                         "Line had length {} but didn't start with expected protocol fd={fd}",
