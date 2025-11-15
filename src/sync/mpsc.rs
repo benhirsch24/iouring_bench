@@ -69,7 +69,10 @@ impl<T: Clone> Sender<T> {
 }
 
 #[derive(Clone)]
-struct Inner<T> where T: Clone {
+struct Inner<T>
+where
+    T: Clone,
+{
     data: Rc<RefCell<VecDeque<T>>>,
     receiver_task_id: Rc<RefCell<Option<u64>>>,
     closed: Rc<RefCell<bool>>,
@@ -81,5 +84,12 @@ pub fn channel<T: Clone>() -> (Receiver<T>, Sender<T>) {
         receiver_task_id: Rc::new(RefCell::new(None)),
         closed: Rc::new(RefCell::new(false)),
     };
-    (Receiver { inner: inner.clone() }, Sender { inner: inner.clone() })
+    (
+        Receiver {
+            inner: inner.clone(),
+        },
+        Sender {
+            inner: inner.clone(),
+        },
+    )
 }

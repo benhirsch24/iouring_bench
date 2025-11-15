@@ -74,4 +74,3 @@ impl Drop for Guard {
         }
     }
 }
-

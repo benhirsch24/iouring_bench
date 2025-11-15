@@ -26,10 +26,10 @@ fn main() -> anyhow::Result<()> {
             match rx.recv().await {
                 Some(i) => {
                     println!("Got {i}");
-                    if i == N-2 {
+                    if i == N - 2 {
                         rx.close();
                     }
-                },
+                }
                 None => {
                     uring::exit();
                     return;

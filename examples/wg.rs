@@ -7,7 +7,6 @@ use iouring_bench::uring;
 fn main() -> anyhow::Result<()> {
     env_logger::init();
 
-
     uring::init(uring::UringArgs {
         uring_size: 1024,
         submissions_threshold: 1024,

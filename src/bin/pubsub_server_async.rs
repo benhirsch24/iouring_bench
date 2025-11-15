@@ -9,6 +9,7 @@ use std::{cell::RefCell, rc::Rc};
 
 use iouring_bench::executor;
 use iouring_bench::net as unet;
+use iouring_bench::sync::mpsc;
 use iouring_bench::timeout::TimeoutFuture as Timeout;
 use iouring_bench::uring;
 
@@ -30,9 +31,11 @@ struct Args {
 
 #[derive(Default)]
 struct SubscriberInfo {
-    streams: HashMap<RawFd, unet::TcpStream>,
+    senders: HashMap<RawFd, mpsc::Sender<Rc<String>>>,
     sent: u64,
 }
+
+static OK: &[u8] = b"OK\r\n";
 
 async fn handle_publisher(
     mut reader: BufReader<unet::TcpStream>,
@@ -43,8 +46,7 @@ async fn handle_publisher(
     let task_id = executor::get_task_id();
     let fd = writer.as_raw_fd();
     debug!("Handling publisher channel={channel} fd={fd} task_id={task_id}");
-    let ok = b"OK\r\n";
-    writer.write_all(ok).await.expect("OK");
+    writer.write_all(OK).await.expect("OK");
     trace!("OK fd={fd} task_id={task_id}");
 
     loop {
@@ -59,33 +61,30 @@ async fn handle_publisher(
                     "Got message {} channel={channel} fd={fd} task_id={task_id}",
                     line.replace("\n", "\\n").replace("\r", "\\r")
                 );
-                // TODO: This is ugly af but it works
-                let streams = {
-                    let mut streams = Vec::new();
+                let senders = {
+                    let mut senders = Vec::new();
                     if let Some(set) = submap.borrow().get(&channel) {
-                        for (_, s) in set.streams.iter() {
-                            streams.push(unet::TcpStream::new(s.as_raw_fd()));
+                        for sender in set.senders.values() {
+                            senders.push(sender.clone());
                         }
                     }
-                    streams
+                    senders
                 };
-                for mut s in streams {
-                    executor::spawn({
-                        // TODO: could probably refcount this line. Maybe Bytes?
-                        let line = line.clone();
-                        let channel = channel.clone();
-                        let submap = submap.clone();
-                        async move {
-                            let task_id = executor::get_task_id();
-                            if let Err(e) = s.write_all(line.as_bytes()).await {
-                                error!(
-                                    "Failed to write line to channel={channel} fd={} task_id={task_id}: {e}",
-                                    s.as_raw_fd()
-                                );
-                            }
-                            submap.borrow_mut().get_mut(&channel).unwrap().sent += 1;
+                let payload = Rc::new(line.clone());
+                let mut delivered = 0u64;
+                for mut sender in senders {
+                    match sender.send(payload.clone()) {
+                        Ok(()) => delivered += 1,
+                        Err(mpsc::SendError::Closed) => {
+                            debug!("Sender closed for channel={channel}");
                         }
-                    });
+                        Err(mpsc::SendError::Full) => unreachable!("Channel is unbounded"),
+                    }
+                }
+                if delivered > 0 {
+                    if let Some(info) = submap.borrow_mut().get_mut(&channel) {
+                        info.sent += delivered;
+                    }
                 }
             }
             Err(e) => {
@@ -96,8 +95,6 @@ async fn handle_publisher(
     }
 }
 
-// After reading the subscribe message and sending OK, this task just keeps the subscriber alive until it leaves.
-// The publisher is writing directly to the file descriptor which is shared by the shared map.
 async fn handle_subscriber(
     mut reader: BufReader<unet::TcpStream>,
     mut writer: unet::TcpStream,
@@ -108,17 +105,47 @@ async fn handle_subscriber(
         "Handling subscriber channel={channel} fd={}",
         writer.as_raw_fd()
     );
-    let ok = b"OK\r\n";
-    writer.write_all(ok).await.expect("OK");
+    writer.write_all(OK).await.expect("OK");
 
-    let new_stream_fd = writer.as_raw_fd();
-    let new_stream = unet::TcpStream::new(writer.as_raw_fd());
+    let subscriber_fd = writer.as_raw_fd();
+    let (rx_inner, tx) = mpsc::channel::<Rc<String>>();
+    let rx = Rc::new(RefCell::new(rx_inner));
     let _ = submap
         .borrow_mut()
         .entry(channel.clone())
         .or_default()
-        .streams
-        .insert(new_stream_fd, new_stream);
+        .senders
+        .insert(subscriber_fd, tx);
+
+    executor::spawn({
+        let rx = rx.clone();
+        let mut writer = writer;
+        let channel = channel.clone();
+        async move {
+            let task_id = executor::get_task_id();
+            let fd = writer.as_raw_fd();
+            loop {
+                let fut = { rx.borrow_mut().recv() };
+                match fut.await {
+                    Some(msg) => {
+                        if let Err(e) = writer.write_all(msg.as_bytes()).await {
+                            error!(
+                                "Failed to write line to channel={channel} fd={fd} task_id={task_id}: {e}"
+                            );
+                            break;
+                        }
+                    }
+                    None => {
+                        debug!("Writer exiting channel={channel} fd={fd} task_id={task_id}");
+                        break;
+                    }
+                }
+            }
+            if let Err(e) = writer.close().await {
+                warn!("Failed to close writer fd={fd} channel={channel}: {e}");
+            }
+        }
+    });
 
     loop {
         let mut line = String::new();
@@ -126,17 +153,19 @@ async fn handle_subscriber(
             Ok(n) => {
                 if n == 0 {
                     debug!("Subscriber left");
-                    let _ = submap
-                        .borrow_mut()
-                        .get_mut(&channel)
-                        .unwrap()
-                        .streams
-                        .remove(&new_stream_fd);
+                    if let Some(info) = submap.borrow_mut().get_mut(&channel) {
+                        info.senders.remove(&subscriber_fd);
+                    }
+                    rx.borrow_mut().close();
                     return;
                 }
             }
             Err(e) => {
                 error!("Got error {e}");
+                if let Some(info) = submap.borrow_mut().get_mut(&channel) {
+                    info.senders.remove(&subscriber_fd);
+                }
+                rx.borrow_mut().close();
                 return;
             }
         }

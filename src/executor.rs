@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::task::{Context, Poll, Waker};
 
-use futures::future::{LocalBoxFuture, FutureExt};
+use futures::future::{FutureExt, LocalBoxFuture};
 use log::{trace, warn};
 
 #[cfg(test)]
@@ -125,7 +125,11 @@ impl ExecutorInner<'_> {
                     }
                 }
             }
-            trace!("Ready queue handled in {:?}, tasks len={}", start.elapsed(), self.tasks.len());
+            trace!(
+                "Ready queue handled in {:?}, tasks len={}",
+                start.elapsed(),
+                self.tasks.len()
+            );
         }
     }
 
@@ -172,7 +176,10 @@ impl ExecutorInner<'_> {
         let task_id = self.get_next_task_id();
         self.tasks.insert(task_id, fut.fuse().boxed_local());
         self.ready_queue.push(task_id);
-        trace!("Spawning new task task_id={task_id} cur_task={cur_task} rq={}", self.ready_queue.len());
+        trace!(
+            "Spawning new task task_id={task_id} cur_task={cur_task} rq={}",
+            self.ready_queue.len()
+        );
     }
 
     fn wake(&mut self, task_id: u64) {
