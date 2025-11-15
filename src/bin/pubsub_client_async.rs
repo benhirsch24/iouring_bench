@@ -66,6 +66,11 @@ struct Stats {
     writes: Rc<RefCell<HashMap<String, u64>>>,
 }
 
+#[derive(Clone)]
+struct SubscriberStats {
+    received: Rc<RefCell<HashMap<String, u64>>>,
+}
+
 impl Stats {
     fn new() -> Self {
         Self {
@@ -83,6 +88,23 @@ impl Stats {
     }
 }
 
+impl SubscriberStats {
+    fn new() -> Self {
+        Self {
+            received: Rc::new(RefCell::new(HashMap::new())),
+        }
+    }
+
+    fn record(&self, subscriber: &str) {
+        let mut counts = self.received.borrow_mut();
+        *counts.entry(subscriber.to_string()).or_insert(0) += 1;
+    }
+
+    fn total(&self) -> u64 {
+        self.received.borrow().values().sum()
+    }
+}
+
 impl std::fmt::Display for Stats {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let mut total = 0;
@@ -91,6 +113,18 @@ impl std::fmt::Display for Stats {
             total += writes;
         }
         write!(f, "total={total}")?;
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for SubscriberStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let mut total = 0;
+        for (subscriber, count) in self.received.borrow().iter() {
+            writeln!(f, "subscriber={subscriber} messages={count}")?;
+            total += count;
+        }
+        write!(f, "subscriber_total={total}")?;
         Ok(())
     }
 }
@@ -206,7 +240,12 @@ impl Publisher {
     }
 }
 
-async fn handle_subscriber(endpoint: String, channel: String, end: Instant) -> Result<()> {
+async fn handle_subscriber(
+    endpoint: String,
+    channel: String,
+    end: Instant,
+    stats: SubscriberStats,
+) -> Result<()> {
     let mut stream = unet::TcpStream::connect(endpoint).await?;
     info!("Connected subscriber {channel} fd={}", stream.as_raw_fd());
     let subscribe = format!("SUBSCRIBE {channel}\r\n");
@@ -223,6 +262,7 @@ async fn handle_subscriber(endpoint: String, channel: String, end: Instant) -> R
     let mut last = Instant::now();
     let mut num_msgs = 0;
     let mut total_msgs = 0;
+    let subscriber_id = format!("{channel}-{}", executor::get_task_id());
     loop {
         if Instant::now() > end {
             info!("Done! {total_msgs} received");
@@ -233,6 +273,7 @@ async fn handle_subscriber(endpoint: String, channel: String, end: Instant) -> R
         reader.read_line(&mut line).await?;
         num_msgs += 1;
         total_msgs += 1;
+        stats.record(&subscriber_id);
         trace!("Got line {line}");
 
         if last.elapsed() > Duration::from_secs(1) {
@@ -264,6 +305,9 @@ fn main() -> anyhow::Result<()> {
 
     executor::init();
 
+    let start = Instant::now();
+    let end = args.timeout + start;
+
     executor::spawn(async {
         let mut timeout = Timeout::new(Duration::from_secs(5), true);
         loop {
@@ -275,17 +319,30 @@ fn main() -> anyhow::Result<()> {
 
     // At the very end display stats
     let stats = Stats::new();
+    let subscriber_stats = SubscriberStats::new();
     executor::spawn({
         let stats = stats.clone();
+        let log_deadline = end + Duration::from_millis(25);
         async move {
-            let end = args.timeout + std::time::Instant::now() + Duration::from_millis(25);
-            let _ = Timeout::new(end - std::time::Instant::now(), false).await;
+            let now = Instant::now();
+            if log_deadline > now {
+                let _ = Timeout::new(log_deadline - now, false).await;
+            }
             info!("Stats: {}", stats);
         }
     });
+    executor::spawn({
+        let subscriber_stats = subscriber_stats.clone();
+        let log_deadline = end + Duration::from_millis(25);
+        async move {
+            let now = Instant::now();
+            if log_deadline > now {
+                let _ = Timeout::new(log_deadline - now, false).await;
+            }
+            info!("Subscriber stats: {}", subscriber_stats);
+        }
+    });
 
-    let start = std::time::Instant::now();
-    let end = args.timeout + start;
     executor::spawn({
         let stats = stats.clone();
         let stats_path = args.stats_output.clone();
@@ -296,8 +353,14 @@ fn main() -> anyhow::Result<()> {
         }
     });
 
-    let expected = args.subscribers_per_publisher * args.publishers * args.tps * ((end - start).as_secs() as u32);
-    info!("Starting {} subscribers for {} publishers at {}tps every {:?} expecting {} messages", args.subscribers_per_publisher, args.publishers, args.tps, args.timeout, expected);
+    let expected = args.subscribers_per_publisher
+        * args.publishers
+        * args.tps
+        * ((end - start).as_secs() as u32);
+    info!(
+        "Starting {} subscribers for {} publishers at {}tps every {:?} expecting {} messages",
+        args.subscribers_per_publisher, args.publishers, args.tps, args.timeout, expected
+    );
 
     let mut rng = rand::rng();
     let mut wg = WaitGroup::new();
@@ -334,9 +397,13 @@ fn main() -> anyhow::Result<()> {
             executor::spawn({
                 let channel_name = channel_name.clone();
                 let endpoint = args.endpoint.clone();
+                let subscriber_stats = subscriber_stats.clone();
                 debug!("Starting subscriber for {channel_name}");
                 async move {
-                    if let Err(e) = handle_subscriber(endpoint, channel_name.clone(), end).await {
+                    if let Err(e) =
+                        handle_subscriber(endpoint, channel_name.clone(), end, subscriber_stats)
+                            .await
+                    {
                         error!("Error on publisher {channel_name} {e}");
                     }
                 }
